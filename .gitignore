@@ -1,0 +1,4 @@
+out/
+.simple-ide/
+**/.simple-ide/
+__pycache__/

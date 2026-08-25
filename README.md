@@ -34,4 +34,8 @@
 可通过重复的 `--env KEY=VALUE` 传入前端环境变量。汇联易重构项目支持 `--env BACKEND_URL=http://127.0.0.1:<backend-port>`，将 `/api`、`/config`、`/invoice` 等业务代理转发到本地 Artemis。
 
 Maven/Gradle 项目需先拥有外置 JPS 模型。可使用 `--external-config <external_build_system>` 与 `--config-dir <JetBrains config>` 传入已持久化模型和 SDK 表；当前 CLI 不负责导入 Maven/Gradle 模型。
+
+## 分发
+
+运行 `./gradlew test distZip` 后分发 `build/distributions/simple-ide.zip`。解压后使用 `bin/simple-ide-launcher`；它会选择 JDK 17+，也可通过 `SIMPLE_IDE_JAVA_HOME` 明确指定。
 # simple-ide
