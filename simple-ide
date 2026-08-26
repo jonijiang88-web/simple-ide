@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 if [[ ! -x "$ROOT/build/install/simple-ide/bin/simple-ide" ]]; then
   "$ROOT/build.sh"
 fi

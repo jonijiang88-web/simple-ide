@@ -2,7 +2,11 @@ package io.simpleide;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -22,7 +26,6 @@ public final class SimpleIdeTest {
   @Test
   void allocates_available_port() throws Exception {
     int port = SimpleIde.findAvailablePort();
-
     // 验证：系统分配的端口位于有效 TCP 范围。
     assertTrue(port > 0 && port <= 65535);
     // 验证：刚释放的端口尚未被监听。
@@ -32,32 +35,40 @@ public final class SimpleIdeTest {
   /** 验证日志查询只保留最新的指定行数。 */
   @Test
   void returns_log_tail() throws Exception {
-    var file = Files.createTempFile("simple-ide", ".log");
-    Files.writeString(file, "first\nsecond\nthird\n");
-
+    Path file = Files.createTempFile("simple-ide", ".log");
+    Files.write(file, "first\nsecond\nthird\n".getBytes(StandardCharsets.UTF_8));
     // 验证：日志尾部保留最新两行。
-    assertEquals(java.util.List.of("second", "third"), SimpleIde.tail(file, 2));
+    assertEquals(Arrays.asList("second", "third"), SimpleIde.tail(file, 2));
   }
 
-  /** 验证帮助信息包含随机端口和日志查询入口。 */
+  /** 验证帮助信息包含 MCP 端口说明。 */
   @Test
   void describes_runtime_commands() {
     // 验证：运行帮助说明随机端口参数。
     assertTrue(SimpleIde.helpText("run").contains("--random-port"));
-    // 验证：构建帮助说明缓存异常的受控全量重建参数。
-    assertTrue(SimpleIde.helpText("build").contains("--auto-rebuild"));
+    // 验证：构建帮助说明 IDEA MCP 编译。
+    assertTrue(SimpleIde.helpText("build").contains("IDEA MCP"));
     // 验证：顶层帮助列出日志查询命令。
     assertTrue(SimpleIde.helpText(null).contains("logs"));
+    // 验证：顶层帮助列出 MCP 端口环境变量。
+    assertTrue(SimpleIde.helpText(null).contains("IJ_MCP_SERVER_PORT"));
   }
 
-  /** 验证仅对可识别的增量编译缓存异常请求全量重建。 */
+  /** 验证默认 MCP 端口为 64342。 */
   @Test
-  void identifies_recoverable_incremental_build_failures() {
-    // 验证：MapStruct 读取历史匿名内部类产物时可触发一次全量重建。
-    assertTrue(SimpleIde.isRecoverableIncrementalBuildFailure(List.of("error: MapStruct cannot access ApplicationService$10.class")));
-    // 验证：JPS 明确报告 class 读取损坏时可触发一次全量重建。
-    assertTrue(SimpleIde.isRecoverableIncrementalBuildFailure(List.of("error reading /tmp/out/ApplicationService$10.class; bad class file")));
-    // 验证：单独缺少 Builder 方法仍按真实编译错误处理。
-    assertFalse(SimpleIde.isRecoverableIncrementalBuildFailure(List.of("cannot find symbol: method builder()")));
+  void default_mcp_port() {
+    // 验证：默认 MCP 端口为 64342。
+    assertEquals(64342, SimpleIde.DEFAULT_MCP_PORT);
+  }
+
+  /** 验证 JSON 序列化基本类型。 */
+  @Test
+  void json_serialization() {
+    // 验证：字符串值被正确转义。
+    assertEquals("\"hello\"", SimpleIde.json("hello"));
+    // 验证：布尔值序列化正确。
+    assertEquals("true", SimpleIde.json(true));
+    // 验证：数字序列化正确。
+    assertEquals("42", SimpleIde.json(42));
   }
 }

@@ -1,4 +1,6 @@
 out/
+build/
+.gradle/
 .simple-ide/
 **/.simple-ide/
 __pycache__/

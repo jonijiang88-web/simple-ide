@@ -3,18 +3,18 @@ set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
-candidates=("${SIMPLE_IDE_JAVA_HOME:-}" "${JAVA_HOME:-}" "/usr/lib/jvm/java-17-openjdk-amd64" "/usr/lib/jvm/java-1.17.0-openjdk-amd64")
+candidates=("${SIMPLE_IDE_JAVA_HOME:-}" "${JAVA_HOME:-}" "/usr/lib/jvm/java-8-openjdk-amd64" "/usr/lib/jvm/java-1.8.0-openjdk-amd64" "/usr/lib/jvm/java-17-openjdk-amd64" "/usr/lib/jvm/java-1.17.0-openjdk-amd64")
 
 for candidate in "${candidates[@]}"; do
   [[ -x "$candidate/bin/java" ]] || continue
   version="$($candidate/bin/java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
   major="${version%%.*}"
   [[ "$major" == "1" ]] && major="${version#1.}" && major="${major%%.*}"
-  if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 17 )); then
+  if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 8 )); then
     export JAVA_HOME="$candidate"
     exec "$ROOT/bin/simple-ide" "$@"
   fi
 done
 
-echo "simple-ide requires JDK 17+. Set SIMPLE_IDE_JAVA_HOME to a compatible JDK." >&2
+echo "simple-ide requires JDK 8+. Set SIMPLE_IDE_JAVA_HOME to a compatible JDK." >&2
 exit 1
