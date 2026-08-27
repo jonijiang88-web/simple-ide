@@ -98,19 +98,31 @@ public final class SimpleIde {
     System.out.println(result);
   }
 
-  /** 通过 IDEA MCP 执行编译。返回 true 表示成功。 */
-  private static boolean buildViaMcp(Path project, List<String> modules, int timeoutSec) throws IOException, InterruptedException {
+  /** 通过 IDEA MCP 执行项目编译。返回 true 表示成功。 */
+  private static boolean buildViaMcp(Path project, List<String> modules, List<String> explicitFiles, int timeoutSec, boolean autoRebuild) throws IOException, InterruptedException {
     McpClient mcp = connectMcp(project);
     if (mcp == null) return false;
 
-    String moduleName = modules.isEmpty() ? guessMainModule(project) : modules.get(0);
+    String projectPathStr = project.toAbsolutePath().normalize().toString();
+
+    // 编译前先触发 IDEA VFS 同步，确保外部修改的文件被 IDEA 内部感知
+    try {
+      mcp.callToolViaSse("git_status", mapOf("projectPath", projectPathStr));
+    }
+    catch (Exception ignored) {}
+
     Map<String, Object> args = new LinkedHashMap<String, Object>();
-    args.put("projectPath", project.toString());
-    args.put("target_module", moduleName);
-    args.put("timeout", timeoutSec);
+    args.put("projectPath", projectPathStr);
+    args.put("rebuild", autoRebuild);
+    args.put("timeout", timeoutSec * 1000);
+
+    // 仅在用户显式指定 --file 时才限制编译范围；默认由 IDEA JPS 依赖图自动做全局增量级联编译
+    if (!explicitFiles.isEmpty()) {
+      args.put("filesToRebuild", explicitFiles);
+    }
 
     try {
-      String result = mcp.callToolViaSse("build_module_with_dependencies", args);
+      String result = mcp.callToolViaSse("build_project", args);
       System.out.println(mcpResultToBuildJson(result));
       return true;
     }
@@ -118,6 +130,52 @@ public final class SimpleIde {
       System.err.println("IDEA MCP 编译失败，降级到 JPS: " + e.getMessage());
       return false;
     }
+  }
+
+  /** 获取 git 工作区中修改或新增的源文件相对路径列表。 */
+  static List<String> collectGitModifiedFiles(Path project) {
+    try {
+      Process process = new ProcessBuilder("git", "status", "--porcelain")
+        .directory(project.toFile())
+        .redirectErrorStream(true)
+        .start();
+      java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+      byte[] data = new byte[1024];
+      int n;
+      while ((n = process.getInputStream().read(data, 0, data.length)) != -1) {
+        buffer.write(data, 0, n);
+      }
+      process.waitFor();
+      return parseGitStatusOutput(buffer.toString(StandardCharsets.UTF_8.name()));
+    }
+    catch (Exception e) {
+      return new ArrayList<String>();
+    }
+  }
+
+  /** 从 git status porcelain 输出解析有效源文件相对路径列表。 */
+  static List<String> parseGitStatusOutput(String output) {
+    List<String> result = new ArrayList<String>();
+    if (output == null || output.isEmpty()) return result;
+    String[] lines = output.split("\n");
+    for (String rawLine : lines) {
+      if (rawLine.length() < 4) continue;
+      String status = rawLine.substring(0, 2);
+      if (status.contains("D")) continue;
+      String filePath = rawLine.substring(3).trim();
+      if (filePath.startsWith("\"") && filePath.endsWith("\"")) {
+        filePath = filePath.substring(1, filePath.length() - 1);
+      }
+      if (isSourceFile(filePath)) {
+        result.add(filePath);
+      }
+    }
+    return result;
+  }
+
+  /** 判断文件是否为 Java/Kotlin/Groovy 等需编译的源码文件。 */
+  private static boolean isSourceFile(String path) {
+    return path.endsWith(".java") || path.endsWith(".kt") || path.endsWith(".groovy") || path.endsWith(".scala");
   }
 
   /** 从 IDEA 模块文件中猜测主模块名。 */
@@ -147,7 +205,7 @@ public final class SimpleIde {
   }
 
   /** 从 MCP 响应中提取实际的 JSON 内容（处理 content[].text 包装）。 */
-  private static String unwrapMcpContent(String mcpResponse) {
+  static String unwrapMcpContent(String mcpResponse) {
     // MCP tool result 格式: {"content":[{"text":"...","type":"text"}],"isError":false}
     // 提取 content[0].text 中的文本
     int textStart = mcpResponse.indexOf("\"text\":\"");
@@ -164,21 +222,89 @@ public final class SimpleIde {
     return text;
   }
 
-  /** 将 MCP build 返回转换为 simple-ide 标准 build JSON。 */
-  private static String mcpResultToBuildJson(String mcpResult) {
+  /** 将 MCP build_project / build 返回转换为 simple-ide 标准 build JSON。 */
+  static String mcpResultToBuildJson(String mcpResult) {
     String content = unwrapMcpContent(mcpResult);
-    boolean ok = content.contains("\"ok\":true") || content.contains("\"ok\": true");
+    boolean isSuccess = content.contains("\"isSuccess\":true") || content.contains("\"isSuccess\": true")
+      || content.contains("\"ok\":true") || content.contains("\"ok\": true");
+    boolean timedOut = content.contains("\"timedOut\":true") || content.contains("\"timedOut\": true");
+
     List<Map<String, Object>> problems = new ArrayList<Map<String, Object>>();
-    if (!ok) {
-      problems.add(mapOf("kind", "ERROR", "message", "IDEA MCP 编译失败: " + content));
+    if (timedOut) {
+      problems.add(mapOf("kind", "ERROR", "message", "IDEA MCP 编译超时"));
     }
-    else {
+
+    List<Map<String, Object>> extracted = extractProblems(content);
+    if (!extracted.isEmpty()) {
+      problems.addAll(extracted);
+    }
+    else if (!isSuccess && !timedOut) {
       List<String> errors = extractStringArray(content, "errors");
-      for (String err : errors) problems.add(mapOf("kind", "ERROR", "message", err));
-      List<String> warnings = extractStringArray(content, "warnings");
-      for (String w : warnings) problems.add(mapOf("kind", "WARNING", "message", w));
+      if (!errors.isEmpty()) {
+        for (String err : errors) problems.add(mapOf("kind", "ERROR", "message", err));
+        List<String> warnings = extractStringArray(content, "warnings");
+        for (String w : warnings) problems.add(mapOf("kind", "WARNING", "message", w));
+      }
+      else {
+        problems.add(mapOf("kind", "ERROR", "message", "IDEA MCP 编译失败: " + content));
+      }
     }
-    return json(mapOf("success", ok, "problems", problems, "engine", "idea-mcp"));
+
+    boolean finalSuccess = isSuccess && !timedOut && (problems.isEmpty() || problems.stream().noneMatch(p -> "ERROR".equals(p.get("kind"))));
+    return json(mapOf("success", finalSuccess, "problems", problems, "engine", "idea-mcp"));
+  }
+
+  /** 从 JSON 中解析 problems 列表。 */
+  static List<Map<String, Object>> extractProblems(String json) {
+    List<Map<String, Object>> problems = new ArrayList<Map<String, Object>>();
+    int idx = json.indexOf("\"problems\"");
+    if (idx < 0) return problems;
+    int bracketStart = json.indexOf('[', idx);
+    if (bracketStart < 0) return problems;
+    int bracketEnd = json.lastIndexOf(']');
+    if (bracketEnd <= bracketStart) return problems;
+    String arrayContent = json.substring(bracketStart + 1, bracketEnd).trim();
+    if (arrayContent.isEmpty()) return problems;
+
+    int pos = 0;
+    while (pos < arrayContent.length()) {
+      int objStart = arrayContent.indexOf('{', pos);
+      if (objStart < 0) break;
+      int objEnd = arrayContent.indexOf('}', objStart);
+      if (objEnd < 0) break;
+      String objStr = arrayContent.substring(objStart, objEnd + 1);
+      Map<String, Object> prob = new LinkedHashMap<String, Object>();
+      String kind = extractJsonString(objStr, "kind");
+      prob.put("kind", kind != null ? kind : "ERROR");
+      String file = extractJsonString(objStr, "file");
+      if (file != null) prob.put("file", file);
+      String lineStr = extractJsonNumber(objStr, "line");
+      if (lineStr != null) {
+        try { prob.put("line", Integer.parseInt(lineStr)); } catch (NumberFormatException ignored) {}
+      }
+      String colStr = extractJsonNumber(objStr, "column");
+      if (colStr != null) {
+        try { prob.put("column", Integer.parseInt(colStr)); } catch (NumberFormatException ignored) {}
+      }
+      String msg = extractJsonString(objStr, "message");
+      prob.put("message", msg != null ? msg : "");
+      problems.add(prob);
+      pos = objEnd + 1;
+    }
+    return problems;
+  }
+
+  /** 从 JSON 中提取指定数字字段值字符串。 */
+  private static String extractJsonNumber(String json, String field) {
+    String key = "\"" + field + "\":";
+    int idx = json.indexOf(key);
+    if (idx < 0) return null;
+    int start = idx + key.length();
+    while (start < json.length() && Character.isWhitespace(json.charAt(start))) start++;
+    if (start >= json.length()) return null;
+    int end = start;
+    while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) end++;
+    return start == end ? null : json.substring(start, end);
   }
 
   /** 从 JSON 中提取指定字段的字符串数组。 */
@@ -324,8 +450,10 @@ public final class SimpleIde {
   private static void build(Command command) throws Exception {
     Path project = command.project();
     List<String> modules = command.values("module");
+    List<String> files = command.values("file");
     int timeoutSec = Integer.parseInt(command.option("timeout", "1800"));
-    if (buildViaMcp(project, modules, timeoutSec)) return;
+    boolean autoRebuild = command.flag("auto-rebuild") || command.flag("rebuild");
+    if (buildViaMcp(project, modules, files, timeoutSec, autoRebuild)) return;
     throw new IllegalStateException("IDEA MCP 不可用，请确认 IDEA 已打开项目且 idea-mcp-ext 插件已安装");
   }
 
@@ -659,13 +787,17 @@ public final class SimpleIde {
     System.out.println(json(mapOf("projectPath", project.toString(), "configuration", configuration, "logPath", log.toString(), "lines", tail(log, lines))));
   }
 
-  /** 在 IDEA 中打开项目，IDEA 未运行时自动启动。 */
+  /** 在 IDEA 中打开项目，IDEA 未运行时以独立后台进程启动并等待 MCP 端口就绪。 */
   private static void open(Command command) throws Exception {
     Path project = command.project();
     int port = mcpPort();
 
-    // 确保调用 idea 命令行打开目标项目窗口
-    new ProcessBuilder("idea", project.toString()).start();
+    // 确保以 setsid 独立后台会话方式调用 idea 命令行打开目标项目窗口，避免阻塞或被父进程生命周期影响
+    new ProcessBuilder("setsid", "idea", project.toString())
+      .redirectInput(new File("/dev/null"))
+      .redirectOutput(new File("/dev/null"))
+      .redirectError(new File("/dev/null"))
+      .start();
 
     // IDEA 已运行且 MCP 可达
     if (McpClient.isAvailable(port)) {

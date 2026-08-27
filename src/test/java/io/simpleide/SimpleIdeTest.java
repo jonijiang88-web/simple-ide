@@ -71,4 +71,58 @@ public final class SimpleIdeTest {
     // 验证：数字序列化正确。
     assertEquals("42", SimpleIde.json(42));
   }
+
+  /** 验证 build_project 成功响应的解析。 */
+  @Test
+  void parses_build_project_success_response() {
+    String mcpResult = "{\"content\":[{\"text\":\"{\\\"isSuccess\\\":true,\\\"problems\\\":[],\\\"timedOut\\\":false}\",\"type\":\"text\"}],\"isError\":false}";
+    String result = SimpleIde.mcpResultToBuildJson(mcpResult);
+    // 验证：构建成功时 success 为 true。
+    assertTrue(result.contains("\"success\":true"));
+    // 验证：构建引擎标识为 idea-mcp。
+    assertTrue(result.contains("\"engine\":\"idea-mcp\""));
+  }
+
+  /** 验证 build_project 错误与超时响应的解析。 */
+  @Test
+  void parses_build_project_error_and_timeout_response() {
+    String errorMcpResult = "{\"content\":[{\"text\":\"{\\\"isSuccess\\\":false,\\\"problems\\\":[{\\\"kind\\\":\\\"ERROR\\\",\\\"file\\\":\\\"/path/Demo.java\\\",\\\"line\\\":10,\\\"column\\\":5,\\\"message\\\":\\\"找不到符号\\\"}],\\\"timedOut\\\":false}\",\"type\":\"text\"}],\"isError\":false}";
+    String errorResult = SimpleIde.mcpResultToBuildJson(errorMcpResult);
+    // 验证：构建包含错误时 success 为 false。
+    assertTrue(errorResult.contains("\"success\":false"));
+    // 验证：错误信息中包含具体的编译报错消息。
+    assertTrue(errorResult.contains("找不到符号"));
+
+    String timeoutMcpResult = "{\"content\":[{\"text\":\"{\\\"isSuccess\\\":false,\\\"problems\\\":[],\\\"timedOut\\\":true}\",\"type\":\"text\"}],\"isError\":false}";
+    String timeoutResult = SimpleIde.mcpResultToBuildJson(timeoutMcpResult);
+    // 验证：构建超时时 success 为 false。
+    assertTrue(timeoutResult.contains("\"success\":false"));
+    // 验证：超时结果包含超时提示信息。
+    assertTrue(timeoutResult.contains("超时"));
+  }
+
+  /** 验证从 git status 输出解析修改的源文件相对路径。 */
+  @Test
+  void parses_git_status_modified_source_files() {
+    String gitOutput = " M src/main/java/com/example/App.java\n"
+      + "M  src/test/java/com/example/AppTest.java\n"
+      + "?? src/main/java/com/example/NewFile.kt\n"
+      + "?? README.md\n"
+      + " D src/main/java/com/example/Deleted.java\n";
+    List<String> files = SimpleIde.parseGitStatusOutput(gitOutput);
+    // 验证：解析出 3 个修改/新增的 Java/Kotlin 源文件。
+    assertEquals(3, files.size());
+    // 验证：包含 App.java。
+    assertTrue(files.contains("src/main/java/com/example/App.java"));
+    // 验证：包含 AppTest.java。
+    assertTrue(files.contains("src/test/java/com/example/AppTest.java"));
+    // 验证：包含 NewFile.kt。
+    assertTrue(files.contains("src/main/java/com/example/NewFile.kt"));
+    // 验证：不包含非源文件 README.md。
+    assertFalse(files.contains("README.md"));
+    // 验证：不包含已删除的源文件。
+    assertFalse(files.contains("src/main/java/com/example/Deleted.java"));
+  }
 }
+
+
