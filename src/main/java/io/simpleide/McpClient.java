@@ -178,7 +178,7 @@ final class McpClient {
     throw new IOException("SSE 流关闭，未收到 id=" + targetId + " 的响应");
   }
 
-  /** 从 JSON-RPC 响应中提取 result 部分。 */
+  /** 从 JSON-RPC 响应中提取 result 部分；工具级错误（result.isError=true）会转换为异常。 */
   private String extractResult(String jsonRpc) throws IOException {
     if (jsonRpc.contains("\"error\"")) {
       int errorStart = jsonRpc.indexOf("\"error\"");
@@ -189,7 +189,38 @@ final class McpClient {
     int resultStart = jsonRpc.indexOf("\"result\"");
     if (resultStart < 0) throw new IOException("MCP 响应中无 result 字段: " + jsonRpc);
     int colonPos = jsonRpc.indexOf(':', resultStart);
-    return extractJsonObject(jsonRpc, colonPos + 1);
+    String result = extractJsonObject(jsonRpc, colonPos + 1);
+    String toolError = toolErrorMessage(result);
+    if (toolError != null) throw new IOException(toolError);
+    return result;
+  }
+
+  /**
+   * 从 MCP 工具结果中提取错误文本。
+   * MCP 的工具级错误使用 result.isError=true，错误信息位于 content[].text；
+   * 返回 null 表示结果不是错误。
+   */
+  static String toolErrorMessage(String result) {
+    if (result == null) return null;
+    if (!result.contains("\"isError\":true") && !result.contains("\"isError\": true")) return null;
+    int idx = result.indexOf("\"text\":\"");
+    if (idx < 0) return result;
+    idx += "\"text\":\"".length();
+    StringBuilder sb = new StringBuilder();
+    for (int i = idx; i < result.length(); i++) {
+      char c = result.charAt(i);
+      if (c == '\\' && i + 1 < result.length()) {
+        char next = result.charAt(i + 1);
+        if (next == 'n') sb.append('\n');
+        else if (next == 't') sb.append('\t');
+        else sb.append(next);
+        i++;
+        continue;
+      }
+      if (c == '"') break;
+      sb.append(c);
+    }
+    return sb.toString();
   }
 
   /** 从指定位置提取 JSON 对象或数组。 */

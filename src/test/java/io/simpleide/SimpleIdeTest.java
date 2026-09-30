@@ -2,6 +2,7 @@ package io.simpleide;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,7 +13,9 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /** 验证命令行入口的最小解析能力。 */
 public final class SimpleIdeTest {
@@ -286,6 +289,96 @@ public final class SimpleIdeTest {
     assertTrue(updatedBuildJson.contains("42"));
   }
 
+  /** 验证能从 mcp_ext_status 响应中解析出宿主项目 base 路径。 */
+  @Test
+  void extracts_project_base_path_from_mcp_ext_status_response() {
+    String response = "{\"content\":[{\"text\":\"{\\\"ok\\\":true,\\\"data\\\":{\\\"pluginVersion\\\":\\\"0.1.0-SNAPSHOT\\\",\\\"projectName\\\":\\\"dev\\\",\\\"projectBasePath\\\":\\\"/home/lijiang/code/artemis/dev\\\",\\\"mcpServerEnabled\\\":true},\\\"error\\\":null,\\\"warnings\\\":[]}\",\"type\":\"text\"}],\"isError\":false}";
+    // 验证：解析出的 base 路径与响应中的 projectBasePath 一致。
+    assertEquals("/home/lijiang/code/artemis/dev", SimpleIde.extractProjectBasePath(response));
+  }
+
+  /** 验证宿主项目退化为父目录（嵌套项目）时校验必须失败。 */
+  @Test
+  void rejects_degraded_nested_project_target() {
+    try {
+      SimpleIde.checkMcpTarget("/home/lijiang/code/ai-e2e-test/code/repository/artemis", "/home/lijiang/code/ai-e2e-test");
+      fail("目标项目退化为父目录时应当抛出异常");
+    }
+    catch (IOException expected) {
+      // 验证：错误信息同时给出请求路径与实际宿主路径，便于定位。
+      assertTrue(expected.getMessage().contains("/home/lijiang/code/ai-e2e-test/code/repository/artemis"));
+      assertTrue(expected.getMessage().contains("/home/lijiang/code/ai-e2e-test"));
+    }
+  }
+
+  /** 验证宿主项目一致时校验放行。 */
+  @Test
+  void accepts_matching_mcp_target() throws Exception {
+    // 验证：请求路径与宿主路径完全一致时不抛异常。
+    SimpleIde.checkMcpTarget("/home/lijiang/code/artemis/dev", "/home/lijiang/code/artemis/dev");
+  }
+
+  /** 验证无法确认宿主项目时必须失败，不能静默放行。 */
+  @Test
+  void rejects_unresolved_mcp_target() {
+    try {
+      SimpleIde.checkMcpTarget("/home/lijiang/code/artemis/dev", null);
+      fail("无法确认宿主项目时应当抛出异常");
+    }
+    catch (IOException expected) {
+      // 验证：错误信息说明无法确认目标项目。
+      assertTrue(expected.getMessage().contains("无法确认"));
+    }
+  }
+
+  /** 验证 MCP 工具级错误（isError=true）能被识别。 */
+  @Test
+  void detects_is_error_tool_result() {
+    String result = "{\"content\":[{\"text\":\"File not found: /home/lijiang/code/ai-e2e-test/src/main/java/Nope.java\",\"type\":\"text\"}],\"isError\":true}";
+    // 验证：返回的错误文本包含原始错误信息。
+    assertTrue(McpClient.toolErrorMessage(result).contains("File not found"));
+  }
+
+  /** 验证成功结果不会误判为错误。 */
+  @Test
+  void ignores_successful_tool_result() {
+    String result = "{\"content\":[{\"text\":\"{\\\"isSuccess\\\":true,\\\"problems\\\":[]}\",\"type\":\"text\"}],\"isError\":false}";
+    // 验证：成功结果不产生错误消息。
+    assertNull(McpClient.toolErrorMessage(result));
+  }
+
+  /** 验证显式 --file 优先于 git 改动探测。 */
+  @Test
+  void prefers_explicit_files_over_git_changes() {
+    // 验证：显式指定文件时原样返回，不触发 git 探测。
+    assertEquals(Arrays.asList("src/A.java"),
+      SimpleIde.resolveFilesToRebuild(java.nio.file.Paths.get("/nonexistent-project"), Arrays.asList("src/A.java")));
+  }
+
+  /** 验证非 git 目录下不会产生待编译文件列表。 */
+  @Test
+  void falls_back_to_empty_files_when_not_a_git_repository() {
+    // 验证：无 git 仓库且未显式指定文件时返回空列表。
+    assertTrue(SimpleIde.resolveFilesToRebuild(java.nio.file.Paths.get("/nonexistent-project"), new ArrayList<String>()).isEmpty());
+  }
+
+  /** 验证 --file 传入的路径被归一化为相对项目根路径。 */
+  @Test
+  void normalizes_file_path_to_project_relative() {
+    // 验证：项目内的绝对路径转为相对项目根路径（filesToRebuild 要求相对路径）。
+    assertEquals("src/main/A.java",
+      SimpleIde.toProjectRelative(java.nio.file.Paths.get("/proj"), "/proj/src/main/A.java"));
+    // 验证：相对路径按项目根解析后仍为相对路径。
+    assertEquals("src/main/A.java",
+      SimpleIde.toProjectRelative(java.nio.file.Paths.get("/proj"), "src/main/A.java"));
+  }
+
+  /** 验证 git rename 输出只保留新路径。 */
+  @Test
+  void parses_renamed_file_to_new_path() {
+    // 验证：R 状态取箭头后的新路径，避免把 "old -> new" 整串当作文件路径。
+    assertEquals(Arrays.asList("src/B.java"), SimpleIde.parseGitStatusOutput("R  src/A.java -> src/B.java\n"));
+  }
 }
 
 

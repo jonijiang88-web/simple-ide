@@ -89,6 +89,51 @@ public final class SimpleIde {
     return new McpClient(port);
   }
 
+  /**
+   * 校验 IDEA MCP 实例解析出的目标项目与请求一致。
+   * 插件在「请求路径嵌套于另一个已打开项目内」时会退化为父项目，
+   * 此时编译会落到父项目（可能是无源根的 EMPTY_MODULE）并返回伪成功，因此必须提前拦截。
+   *
+   * @param mcp     已连接的 MCP 客户端
+   * @param project 请求的目标项目路径
+   * @return 校验通过时原样返回传入的客户端
+   */
+  static McpClient verifyMcpTarget(McpClient mcp, Path project) throws IOException {
+    String expected = project.toAbsolutePath().normalize().toString();
+    String actual;
+    try {
+      actual = extractProjectBasePath(mcp.callToolViaSse("mcp_ext_status", mapOf("projectPath", expected)));
+    }
+    catch (IOException e) {
+      throw new IOException("无法确认 IDEA MCP 的目标项目(projectPath=" + expected + "): " + e.getMessage(), e);
+    }
+    checkMcpTarget(expected, actual);
+    return mcp;
+  }
+
+  /**
+   * 校验请求路径与 MCP 宿主路径是否精确一致；不一致或无法确认时抛出异常，避免伪成功。
+   *
+   * @param expected 请求的目标项目绝对路径（已规范化）
+   * @param actual   MCP 解析出的宿主项目 base 路径，无法解析时为 null
+   */
+  static void checkMcpTarget(String expected, String actual) throws IOException {
+    if (actual == null || actual.isEmpty()) {
+      throw new IOException("无法确认 IDEA MCP 的目标项目(projectPath=" + expected + ")，已拒绝编译以避免误编其他项目");
+    }
+    if (!actual.equals(expected)) {
+      throw new IOException("IDEA MCP 目标项目与请求不一致：请求 " + expected + "，实际 " + actual
+        + "。常见原因是请求路径嵌套在另一个已打开项目内，插件会退化为父项目；"
+        + "请关闭父项目，或用 IJ_MCP_SERVER_PORT 指向目标项目所在 IDEA 实例的端口");
+    }
+  }
+
+  /** 从 mcp_ext_status 响应中解析宿主项目 base 路径；响应中不含该字段时返回 null。 */
+  static String extractProjectBasePath(String mcpResponse) {
+    if (mcpResponse == null) return null;
+    return extractJsonString(unwrapMcpContent(mcpResponse), "projectBasePath");
+  }
+
   /** 列出 IDEA MCP Server 上所有可用工具。 */
   private static void tools(Command command) throws Exception {
     Path project = command.project();
@@ -98,20 +143,22 @@ public final class SimpleIde {
     System.out.println(result);
   }
 
-  /** 通过 IDEA MCP 执行项目编译。返回 true 表示成功。 */
-  private static boolean buildViaMcp(Path project, List<String> modules, List<String> explicitFiles, int timeoutSec, boolean autoRebuild) throws IOException, InterruptedException {
+  /** 通过 IDEA MCP 执行项目编译。返回编译状态；返回 null 表示 MCP 不可用。 */
+  private static BuildStatus buildViaMcp(Path project, List<String> modules, List<String> explicitFiles, int timeoutSec, boolean autoRebuild) throws IOException, InterruptedException {
     McpClient mcp = connectMcp(project);
-    if (mcp == null) return false;
+    if (mcp == null) return null;
 
-    try {
-      BuildStatus status = performBuildViaMcp(mcp, project, explicitFiles, timeoutSec, autoRebuild);
-      System.out.println(status.jsonResult);
-      return true;
+    // 编译必须保证目标项目正确：MCP 在嵌套项目场景会把路径解析到父项目并返回伪成功
+    verifyMcpTarget(mcp, project);
+
+    if (!modules.isEmpty()) {
+      // build_project 仅支持按文件（filesToRebuild）限定范围，不支持按模块编译；显式提示避免误以为 --module 生效
+      System.err.println("[warn] --module 在当前 IDEA MCP 后端不生效（build_project 不支持按模块编译），将按项目范围增量编译：" + modules);
     }
-    catch (IOException e) {
-      System.err.println("IDEA MCP 编译失败，降级到 JPS: " + e.getMessage());
-      return false;
-    }
+
+    BuildStatus status = performBuildViaMcp(mcp, project, explicitFiles, timeoutSec, autoRebuild);
+    System.out.println(status.jsonResult);
+    return status;
   }
 
   /** 执行 IDEA MCP 编译并返回构建状态与标准 JSON 结果。 */
@@ -122,16 +169,21 @@ public final class SimpleIde {
     try {
       mcp.callToolViaSse("git_status", mapOf("projectPath", projectPathStr));
     }
-    catch (Exception ignored) {}
+    catch (Exception e) {
+      // 不再静默吞掉：同步失败意味着项目路径或 VFS 状态异常，需要让调用方看见
+      System.err.println("[warn] 编译前 VFS 同步失败: " + e.getMessage());
+    }
 
     Map<String, Object> args = new LinkedHashMap<String, Object>();
     args.put("projectPath", projectPathStr);
     args.put("rebuild", autoRebuild);
     args.put("timeout", timeoutSec * 1000);
 
-    // 仅在用户显式指定 --file 时才限制编译范围；默认由 IDEA JPS 依赖图自动做全局增量级联编译
-    if (!explicitFiles.isEmpty()) {
-      args.put("filesToRebuild", explicitFiles);
+    // IDEA 的增量仅依据 VFS 事件，外部（命令行）改动可能不被感知，导致漏编并返回伪成功；
+    // 因此默认把 git 改动文件显式交给 filesToRebuild 强制纳入编译（--file 显式指定时以其为准）。
+    List<String> filesToRebuild = resolveFilesToRebuild(project, explicitFiles);
+    if (!filesToRebuild.isEmpty()) {
+      args.put("filesToRebuild", filesToRebuild);
     }
 
     String result = mcp.callToolViaSse("build_project", args);
@@ -166,6 +218,51 @@ public final class SimpleIde {
     return json(result);
   }
 
+  /**
+   * 决定本次编译要显式纳入的文件列表。
+   * 显式 --file 优先；否则取 git 工作区改动文件（相对项目根，符合 filesToRebuild 契约）。
+   * 目的是绕开「IDEA 仅依赖 VFS 事件判断增量、从而漏编外部改动并返回伪成功」的行为。
+   *
+   * @param project       目标项目根目录
+   * @param explicitFiles 用户显式指定的文件（--file），可为空
+   * @return 需要强制编译的相对路径列表，可能为空
+   */
+  static List<String> resolveFilesToRebuild(Path project, List<String> explicitFiles) {
+    if (explicitFiles != null && !explicitFiles.isEmpty()) {
+      Path base = project.toAbsolutePath().normalize();
+      List<String> relative = new ArrayList<String>(explicitFiles.size());
+      for (String file : explicitFiles) {
+        relative.add(toProjectRelative(base, file));
+      }
+      return relative;
+    }
+    return collectGitModifiedFiles(project);
+  }
+
+  /**
+   * 将文件路径归一化为相对项目根的路径（filesToRebuild 契约要求相对路径）。
+   * 路径不在项目内或无法解析时原样返回，避免丢失用户输入。
+   *
+   * @param base 项目根绝对路径
+   * @param file 用户传入的文件路径（绝对路径或相对当前工作目录）
+   * @return 相对项目根的路径（'/' 分隔）
+   */
+  static String toProjectRelative(Path base, String file) {
+    if (file == null || file.isEmpty()) return file;
+    try {
+      Path path = Paths.get(file);
+      if (!path.isAbsolute()) {
+        path = base.resolve(path);
+      }
+      path = path.normalize();
+      if (path.startsWith(base)) {
+        return base.relativize(path).toString().replace(File.separatorChar, '/');
+      }
+    }
+    catch (Exception ignored) {}
+    return file;
+  }
+
   /** 获取 git 工作区中修改或新增的源文件相对路径列表。 */
   static List<String> collectGitModifiedFiles(Path project) {
     try {
@@ -183,6 +280,8 @@ public final class SimpleIde {
       return parseGitStatusOutput(buffer.toString(StandardCharsets.UTF_8.name()));
     }
     catch (Exception e) {
+      // 不再静默：git 不可用意味着本次无法强制纳入外部改动，需要让调用方看见
+      System.err.println("[warn] 无法读取 git 改动文件，本次编译不会强制纳入外部改动: " + e.getMessage());
       return new ArrayList<String>();
     }
   }
@@ -197,6 +296,11 @@ public final class SimpleIde {
       String status = rawLine.substring(0, 2);
       if (status.contains("D")) continue;
       String filePath = rawLine.substring(3).trim();
+      // git rename 输出形如 "old -> new"，只保留新路径
+      int arrow = filePath.indexOf(" -> ");
+      if (arrow >= 0) {
+        filePath = filePath.substring(arrow + 4).trim();
+      }
       if (filePath.startsWith("\"") && filePath.endsWith("\"")) {
         filePath = filePath.substring(1, filePath.length() - 1);
       }
@@ -634,14 +738,20 @@ public final class SimpleIde {
     }
   }
 
-  /** 执行实际编译逻辑。 */
+  /** 执行实际编译逻辑；MCP 不可用时抛出异常，编译失败时以非零退出码结束。 */
   private static void executeBuild(Command command, Path project) throws Exception {
     List<String> modules = command.values("module");
     List<String> files = command.values("file");
     int timeoutSec = Integer.parseInt(command.option("timeout", "1800"));
     boolean autoRebuild = command.flag("auto-rebuild") || command.flag("rebuild");
-    if (buildViaMcp(project, modules, files, timeoutSec, autoRebuild)) return;
-    throw new IllegalStateException("IDEA MCP 不可用，请确认 IDEA 已打开项目且 idea-mcp-ext 插件已安装");
+    BuildStatus status = buildViaMcp(project, modules, files, timeoutSec, autoRebuild);
+    if (status == null) {
+      throw new IllegalStateException("IDEA MCP 不可用，请确认 IDEA 已打开项目且 idea-mcp-ext 插件已安装");
+    }
+    if (!status.success) {
+      // 编译失败必须以非零退出码结束，否则调用方仅凭退出码会把失败误判为成功
+      System.exit(1);
+    }
   }
 
   /** 启动 Application：优先 IDEA MCP（支持 --random-port / --port 动态覆盖），失败则本地进程启动。 */
@@ -740,6 +850,9 @@ public final class SimpleIde {
     Path project = command.project();
     McpClient mcp = connectMcp(project);
     if (mcp == null) throw new IOException("IDEA MCP 不可用，无法运行测试");
+
+    // 测试依赖正确的编译目标，先校验再执行前置编译
+    verifyMcpTarget(mcp, project);
 
     String testClass = command.required("class");
     String method = command.option("method", null);
