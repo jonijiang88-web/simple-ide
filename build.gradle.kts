@@ -24,8 +24,19 @@ application {
 distributions {
   main {
     contents {
-      filesMatching("bin/simple-ide-launcher") {
-        filePermissions {
+      from(".") {
+        include("INSTALL.md")
+        include("README.md")
+        include("install.sh")
+        include("skills/**")
+      }
+      filesMatching("bin/*") {
+        permissions {
+          unix("rwxr-xr-x")
+        }
+      }
+      filesMatching("install.sh") {
+        permissions {
           unix("rwxr-xr-x")
         }
       }

@@ -103,6 +103,19 @@ public final class SimpleIde {
     McpClient mcp = connectMcp(project);
     if (mcp == null) return false;
 
+    try {
+      BuildStatus status = performBuildViaMcp(mcp, project, explicitFiles, timeoutSec, autoRebuild);
+      System.out.println(status.jsonResult);
+      return true;
+    }
+    catch (IOException e) {
+      System.err.println("IDEA MCP 编译失败，降级到 JPS: " + e.getMessage());
+      return false;
+    }
+  }
+
+  /** 执行 IDEA MCP 编译并返回构建状态与标准 JSON 结果。 */
+  static BuildStatus performBuildViaMcp(McpClient mcp, Path project, List<String> explicitFiles, int timeoutSec, boolean autoRebuild) throws IOException {
     String projectPathStr = project.toAbsolutePath().normalize().toString();
 
     // 编译前先触发 IDEA VFS 同步，确保外部修改的文件被 IDEA 内部感知
@@ -121,15 +134,36 @@ public final class SimpleIde {
       args.put("filesToRebuild", explicitFiles);
     }
 
-    try {
-      String result = mcp.callToolViaSse("build_project", args);
-      System.out.println(mcpResultToBuildJson(result));
-      return true;
+    String result = mcp.callToolViaSse("build_project", args);
+    String buildJson = mcpResultToBuildJson(result);
+    boolean success = buildJson.contains("\"success\":true") || buildJson.contains("\"success\": true");
+
+    // 编译成功后，对本次 git 修改的源文件检查无用变量/声明提示（Unused declaration）
+    if (success) {
+      try {
+        List<String> modifiedFiles = !explicitFiles.isEmpty() ? explicitFiles : collectGitModifiedFiles(project);
+        if (!modifiedFiles.isEmpty()) {
+          List<Map<String, Object>> unused = queryUnusedDiagnosticsForModifiedFiles(mcp, projectPathStr, modifiedFiles);
+          buildJson = appendUnusedToBuildJson(buildJson, unused);
+        }
+      }
+      catch (Exception ignored) {}
     }
-    catch (IOException e) {
-      System.err.println("IDEA MCP 编译失败，降级到 JPS: " + e.getMessage());
-      return false;
-    }
+
+    return new BuildStatus(success, buildJson);
+  }
+
+  /** 格式化测试前置编译失败时的 JSON 响应。 */
+  static String formatTestPreBuildFailure(String testClass, String method, String buildJson) {
+    Map<String, Object> result = new LinkedHashMap<String, Object>();
+    result.put("success", false);
+    result.put("testClass", testClass);
+    if (method != null) result.put("method", method);
+    result.put("exitCode", 1);
+    result.put("error", "测试前置编译失败");
+    result.put("buildResult", buildJson);
+    result.put("engine", "idea-mcp");
+    return json(result);
   }
 
   /** 获取 git 工作区中修改或新增的源文件相对路径列表。 */
@@ -222,7 +256,7 @@ public final class SimpleIde {
     return text;
   }
 
-  /** 将 MCP build_project / build 返回转换为 simple-ide 标准 build JSON。 */
+  /** 将 MCP build_project / build 返回转换为 simple-ide 标准 build JSON（忽略 WARNING 告警以减少 Token 消耗）。 */
   static String mcpResultToBuildJson(String mcpResult) {
     String content = unwrapMcpContent(mcpResult);
     boolean isSuccess = content.contains("\"isSuccess\":true") || content.contains("\"isSuccess\": true")
@@ -242,8 +276,6 @@ public final class SimpleIde {
       List<String> errors = extractStringArray(content, "errors");
       if (!errors.isEmpty()) {
         for (String err : errors) problems.add(mapOf("kind", "ERROR", "message", err));
-        List<String> warnings = extractStringArray(content, "warnings");
-        for (String w : warnings) problems.add(mapOf("kind", "WARNING", "message", w));
       }
       else {
         problems.add(mapOf("kind", "ERROR", "message", "IDEA MCP 编译失败: " + content));
@@ -254,7 +286,111 @@ public final class SimpleIde {
     return json(mapOf("success", finalSuccess, "problems", problems, "engine", "idea-mcp"));
   }
 
-  /** 从 JSON 中解析 problems 列表。 */
+  /** 判断诊断消息是否属于无用声明或死代码（Unused declaration / 未使用 / 未分配 / 冗余初始值等）。 */
+  static boolean isUnusedDeclarationMessage(String message) {
+    if (message == null || message.isEmpty()) return false;
+    String lower = message.toLowerCase();
+    return message.contains("从未使用")
+      || message.contains("从未分配")
+      || message.contains("从未使用变量")
+      || message.contains("冗余")
+      || lower.contains("never used")
+      || lower.contains("never assigned")
+      || lower.contains("redundant")
+      || lower.contains("unused declaration");
+  }
+
+  /** 从 MCP get_aggregated_diagnostics 返回的 JSON 中提取指定改动文件的无用声明列表。 */
+  static List<Map<String, Object>> extractUnusedDiagnosticsFromMcp(String mcpDiagnosticsJson, List<String> modifiedFiles, String projectBasePath) {
+    List<Map<String, Object>> unusedList = new ArrayList<Map<String, Object>>();
+    if (mcpDiagnosticsJson == null || mcpDiagnosticsJson.isEmpty() || modifiedFiles == null || modifiedFiles.isEmpty()) {
+      return unusedList;
+    }
+
+    String content = unwrapMcpContent(mcpDiagnosticsJson);
+    int idx = content.indexOf("\"top_problems\"");
+    if (idx < 0) return unusedList;
+    int bracketStart = content.indexOf('[', idx);
+    if (bracketStart < 0) return unusedList;
+    int bracketEnd = content.indexOf(']', bracketStart);
+    if (bracketEnd <= bracketStart) return unusedList;
+    String arrayContent = content.substring(bracketStart + 1, bracketEnd).trim();
+    if (arrayContent.isEmpty()) return unusedList;
+
+    // 规范化改动文件集合以便快速比对
+    java.util.Set<String> normalizedModifiedFiles = new java.util.HashSet<String>();
+    for (String mf : modifiedFiles) {
+      String n = mf.replace('\\', '/');
+      if (n.startsWith("./")) n = n.substring(2);
+      normalizedModifiedFiles.add(n);
+    }
+
+    String normBase = projectBasePath != null ? projectBasePath.replace('\\', '/') : "";
+    if (normBase.endsWith("/")) normBase = normBase.substring(0, normBase.length() - 1);
+
+    int pos = 0;
+    while (pos < arrayContent.length()) {
+      int objStart = arrayContent.indexOf('{', pos);
+      if (objStart < 0) break;
+      int objEnd = arrayContent.indexOf('}', objStart);
+      if (objEnd < 0) break;
+      String objStr = arrayContent.substring(objStart, objEnd + 1);
+
+      String rawFile = extractJsonString(objStr, "file");
+      String msg = extractJsonString(objStr, "message");
+      String lineStr = extractJsonNumber(objStr, "line");
+
+      if (rawFile != null && msg != null && isUnusedDeclarationMessage(msg)) {
+        String normFile = rawFile.replace('\\', '/');
+        String relFile = normFile;
+        if (!normBase.isEmpty() && normFile.startsWith(normBase + "/")) {
+          relFile = normFile.substring(normBase.length() + 1);
+        }
+
+        // 仅匹配本次改动的源文件（支持绝对路径或相对路径匹配）
+        if (normalizedModifiedFiles.contains(relFile) || normalizedModifiedFiles.contains(normFile)) {
+          Map<String, Object> entry = new LinkedHashMap<String, Object>();
+          entry.put("file", relFile);
+          if (lineStr != null) {
+            try { entry.put("line", Integer.parseInt(lineStr)); } catch (NumberFormatException ignored) {}
+          }
+          entry.put("message", msg);
+          unusedList.add(entry);
+        }
+      }
+
+      pos = objEnd + 1;
+    }
+
+    return unusedList;
+  }
+
+  /** 将 unused 告警列表追加进编译响应 JSON 中。 */
+  static String appendUnusedToBuildJson(String buildJson, List<Map<String, Object>> unusedList) {
+    if (unusedList == null || unusedList.isEmpty()) return buildJson;
+    int lastBrace = buildJson.lastIndexOf('}');
+    if (lastBrace < 0) return buildJson;
+    return buildJson.substring(0, lastBrace) + ",\"unused\":" + json(unusedList) + "}";
+  }
+
+  /** 查询 IDEA MCP 聚合诊断中属于本次改动文件的无用声明提示。 */
+  private static List<Map<String, Object>> queryUnusedDiagnosticsForModifiedFiles(McpClient mcp, String projectPath, List<String> modifiedFiles) {
+    List<Map<String, Object>> result = new ArrayList<Map<String, Object>>();
+    try {
+      Map<String, Object> diagArgs = new LinkedHashMap<String, Object>();
+      diagArgs.put("projectPath", projectPath);
+      diagArgs.put("scope", "project");
+      diagArgs.put("severity", "warning");
+      diagArgs.put("limit_per_module", 500);
+
+      String diagResponse = mcp.callToolViaSse("get_aggregated_diagnostics", diagArgs);
+      result = extractUnusedDiagnosticsFromMcp(diagResponse, modifiedFiles, projectPath);
+    }
+    catch (Exception ignored) {}
+    return result;
+  }
+
+  /** 从 JSON 中解析 problems 列表（忽略 WARNING 级别告警以减少 Token 消耗，仅保留 ERROR）。 */
   static List<Map<String, Object>> extractProblems(String json) {
     List<Map<String, Object>> problems = new ArrayList<Map<String, Object>>();
     int idx = json.indexOf("\"problems\"");
@@ -273,8 +409,13 @@ public final class SimpleIde {
       int objEnd = arrayContent.indexOf('}', objStart);
       if (objEnd < 0) break;
       String objStr = arrayContent.substring(objStart, objEnd + 1);
-      Map<String, Object> prob = new LinkedHashMap<String, Object>();
       String kind = extractJsonString(objStr, "kind");
+      // 忽略 WARNING 级别的告警信息，仅保留 ERROR 等错误，降低上下文 Token 消耗
+      if ("WARNING".equalsIgnoreCase(kind)) {
+        pos = objEnd + 1;
+        continue;
+      }
+      Map<String, Object> prob = new LinkedHashMap<String, Object>();
       prob.put("kind", kind != null ? kind : "ERROR");
       String file = extractJsonString(objStr, "file");
       if (file != null) prob.put("file", file);
@@ -334,18 +475,49 @@ public final class SimpleIde {
     return result;
   }
 
+  /** 反转义标准 JSON 字符串。 */
+  static String unescapeJsonString(String s) {
+    if (s == null) return null;
+    StringBuilder sb = new StringBuilder(s.length());
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c == '\\' && i + 1 < s.length()) {
+        char next = s.charAt(i + 1);
+        if (next == '"') sb.append('"');
+        else if (next == '\\') sb.append('\\');
+        else if (next == 'n') sb.append('\n');
+        else if (next == 'r') sb.append('\r');
+        else if (next == 't') sb.append('\t');
+        else if (next == '/') sb.append('/');
+        else sb.append(next);
+        i++;
+      } else {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
+  }
+
   /** 从 JSON 中提取指定字符串字段值。 */
-  private static String extractJsonString(String json, String field) {
+  static String extractJsonString(String json, String field) {
     String key = "\"" + field + "\":\"";
     int idx = json.indexOf(key);
     if (idx < 0) return null;
     int start = idx + key.length();
     int end = start;
     while (end < json.length()) {
-      if (json.charAt(end) == '"' && json.charAt(end - 1) != '\\') break;
+      if (json.charAt(end) == '"') {
+        int backslashes = 0;
+        int p = end - 1;
+        while (p >= start && json.charAt(p) == '\\') {
+          backslashes++;
+          p--;
+        }
+        if (backslashes % 2 == 0) break;
+      }
       end++;
     }
-    return json.substring(start, end).replace("\\\"", "\"").replace("\\\\", "\\");
+    return unescapeJsonString(json.substring(start, end));
   }
 
   /** 通过 IDEA MCP execute_run_configuration 启动运行配置并支持动态端口覆盖。 */
@@ -364,6 +536,9 @@ public final class SimpleIde {
     try {
       String result = mcp.callToolViaSse("execute_run_configuration", args);
       String content = unwrapMcpContent(result);
+      if (result.contains("\"isError\":true") || result.contains("\"isError\": true")) {
+        throw new IOException("IDEA MCP execute_run_configuration 失败: " + content);
+      }
       String fullOutputPath = extractJsonString(content, "fullOutputPath");
       Path logPath = fullOutputPath != null && !fullOutputPath.isEmpty()
         ? Paths.get(fullOutputPath)
@@ -446,9 +621,21 @@ public final class SimpleIde {
 
   // ==================== CLI 命令 ====================
 
-  /** 执行编译：优先 IDEA MCP，失败则 fallback 到本地进程。 */
+  /** 执行编译：获取本地排队锁排队，优先 IDEA MCP，失败则 fallback 到本地进程。 */
   private static void build(Command command) throws Exception {
     Path project = command.project();
+    boolean skipLock = command.flag("no-lock") || command.flag("skip-lock");
+    if (skipLock) {
+      executeBuild(command, project);
+      return;
+    }
+    try (BuildLock ignored = BuildLock.acquire(project)) {
+      executeBuild(command, project);
+    }
+  }
+
+  /** 执行实际编译逻辑。 */
+  private static void executeBuild(Command command, Path project) throws Exception {
     List<String> modules = command.values("module");
     List<String> files = command.values("file");
     int timeoutSec = Integer.parseInt(command.option("timeout", "1800"));
@@ -548,7 +735,7 @@ public final class SimpleIde {
     System.out.println(json(mapOf("stopped", true, "configuration", configName, "projectPath", project.toString())));
   }
 
-  /** 通过 IDEA MCP 执行测试。支持 JUnit 4/5，IDEA 自动识别。 */
+  /** 通过 IDEA MCP 执行测试。测试前先强制进行编译校验，防止运行陈旧 class 文件。支持 JUnit 4/5，IDEA 自动识别。 */
   private static void test(Command command) throws Exception {
     Path project = command.project();
     McpClient mcp = connectMcp(project);
@@ -561,6 +748,24 @@ public final class SimpleIde {
     String filePath = "src/test/java/" + testClass.replace('.', '/') + ".java";
     Path testFile = project.resolve(filePath);
     if (!Files.isRegularFile(testFile)) throw new IOException("测试文件不存在：" + testFile);
+
+    // 前置步骤：强制执行全局增量编译校验，防止运行陈旧未更新的 class 文件
+    if (!command.flag("skip-build")) {
+      int timeoutSec = Integer.parseInt(command.option("timeout", "300"));
+      boolean skipLock = command.flag("no-lock") || command.flag("skip-lock");
+      BuildStatus buildStatus;
+      if (skipLock) {
+        buildStatus = performBuildViaMcp(mcp, project, new ArrayList<String>(), timeoutSec, false);
+      } else {
+        try (BuildLock ignored = BuildLock.acquire(project)) {
+          buildStatus = performBuildViaMcp(mcp, project, new ArrayList<String>(), timeoutSec, false);
+        }
+      }
+      if (!buildStatus.success) {
+        System.out.println(formatTestPreBuildFailure(testClass, method, buildStatus.jsonResult));
+        return;
+      }
+    }
 
     // Step 1: 用 get_run_configurations(filePath=...) 获取 run points
     int line = findTestLine(mcp, project, filePath, testClass, method);
@@ -648,9 +853,120 @@ public final class SimpleIde {
     return text.length();
   }
 
-  /** 将 MCP 测试执行结果转换为 simple-ide 标准 JSON。 */
-  private static String mcpTestResultToJson(String content, String testClass, String method) {
-    // 提取 exitCode
+  /** 单个测试用例执行结果。 */
+  static class TestCaseInfo {
+    final String name;
+    String status = "PASSED";
+    long duration = 0;
+    String message;
+    String details;
+    String location;
+
+    TestCaseInfo(String name) {
+      this.name = name;
+    }
+  }
+
+  /** 解析 TeamCity 转义值。 */
+  static String unescapeTeamCity(String val) {
+    if (val == null || val.isEmpty()) return "";
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < val.length(); i++) {
+      char c = val.charAt(i);
+      if (c == '|' && i + 1 < val.length()) {
+        char next = val.charAt(i + 1);
+        if (next == 'n') sb.append('\n');
+        else if (next == 'r') sb.append('\r');
+        else if (next == '\'') sb.append('\'');
+        else if (next == '[') sb.append('[');
+        else if (next == ']') sb.append(']');
+        else if (next == '|') sb.append('|');
+        else sb.append(next);
+        i++;
+      } else {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
+  }
+
+  /** 从 TeamCity 协议行中解析属性键值对。 */
+  static Map<String, String> parseTeamCityAttrs(String line) {
+    Map<String, String> attrs = new LinkedHashMap<String, String>();
+    int start = line.indexOf(' ');
+    if (start < 0) return attrs;
+    int pos = start + 1;
+    while (pos < line.length()) {
+      int eq = line.indexOf('=', pos);
+      if (eq < 0) break;
+      String key = line.substring(pos, eq).trim();
+      int q1 = line.indexOf('\'', eq);
+      if (q1 < 0) break;
+      int q2 = q1 + 1;
+      while (q2 < line.length()) {
+        if (line.charAt(q2) == '\'') {
+          int pipeCount = 0;
+          int back = q2 - 1;
+          while (back >= q1 && line.charAt(back) == '|') {
+            pipeCount++;
+            back--;
+          }
+          if (pipeCount % 2 == 0) break;
+        }
+        q2++;
+      }
+      if (q2 > line.length()) q2 = line.length();
+      String rawVal = line.substring(q1 + 1, Math.min(q2, line.length()));
+      attrs.put(key, unescapeTeamCity(rawVal));
+      pos = q2 + 1;
+    }
+    return attrs;
+  }
+
+  /** 从异常 details 中提取测试失败的用户源码定位（如 DemoTest.java:42）。 */
+  static String extractFailureLocation(String details, String testClass) {
+    if (details == null || details.isEmpty()) return null;
+    String simpleClass = testClass != null && testClass.contains(".")
+      ? testClass.substring(testClass.lastIndexOf('.') + 1)
+      : testClass;
+
+    String fallbackLocation = null;
+    for (String line : details.split("\n")) {
+      String trimmed = line.trim();
+      if (!trimmed.startsWith("at ")) continue;
+      int openParen = trimmed.indexOf('(');
+      int closeParen = trimmed.indexOf(')', openParen);
+      if (openParen > 0 && closeParen > openParen) {
+        String loc = trimmed.substring(openParen + 1, closeParen);
+        if (simpleClass != null && (trimmed.contains(simpleClass) || loc.startsWith(simpleClass))) {
+          return loc;
+        }
+        if (fallbackLocation == null
+          && !trimmed.contains("java.base")
+          && !trimmed.contains("sun.reflect")
+          && !trimmed.contains("jdk.internal")
+          && !trimmed.contains("org.junit")
+          && !trimmed.contains("org.mockito")
+          && !trimmed.contains("org.springframework")) {
+          fallbackLocation = loc;
+        }
+      }
+    }
+    return fallbackLocation;
+  }
+
+  /** 判断一行日志是否属于 Logback 或测试框架的内部诊断杂音。 */
+  static boolean isDiagnosticNoise(String line) {
+    String trimmed = line.trim();
+    if (trimmed.startsWith("##teamcity[")) return true;
+    if (trimmed.contains("|-INFO in ch.qos.logback") || trimmed.contains("|-WARN in ch.qos.logback") || trimmed.contains("|-ERROR in ch.qos.logback")) return true;
+    if (trimmed.contains("ch.qos.logback.core.joran") || trimmed.contains("ch.qos.logback.classic.joran")) return true;
+    return false;
+  }
+
+  /** 将 MCP 测试执行结果转换为 simple-ide 标准 JSON，深度解析 TeamCity 事件并提取关键失败与过滤噪音。 */
+  static String mcpTestResultToJson(String content, String testClass, String method) {
+    // 1. 提取 exitCode
     int exitCode = -1;
     int ecIdx = content.indexOf("\"exitCode\":");
     if (ecIdx >= 0) {
@@ -660,26 +976,175 @@ public final class SimpleIde {
       try { exitCode = Integer.parseInt(content.substring(valStart, valEnd).trim()); } catch (NumberFormatException ignored) {}
     }
 
-    // 提取 output
-    String output = "";
-    int outIdx = content.indexOf("\"output\":\"");
-    if (outIdx >= 0) {
-      int vStart = outIdx + 10;
-      int vEnd = vStart;
-      while (vEnd < content.length()) {
-        if (content.charAt(vEnd) == '"' && content.charAt(vEnd - 1) != '\\') break;
-        vEnd++;
-      }
-      output = content.substring(vStart, vEnd).replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
+    // 2. 优先尝试从 fullOutputPath 读取未被截断的完整控制台输出
+    String rawOutput = null;
+    String fullOutputPath = extractJsonString(content, "fullOutputPath");
+    if (fullOutputPath != null && !fullOutputPath.isEmpty()) {
+      try {
+        Path fullPath = Paths.get(fullOutputPath);
+        if (Files.isRegularFile(fullPath)) {
+          rawOutput = new String(Files.readAllBytes(fullPath), StandardCharsets.UTF_8);
+        }
+      } catch (Exception ignored) {}
     }
 
-    boolean success = exitCode == 0;
+    // 回退：从 content 中提取 output 字段
+    if (rawOutput == null) {
+      String fallback = extractJsonString(content, "output");
+      rawOutput = fallback != null ? fallback : "";
+    }
+
+    // 3. 解析 TeamCity 事件与纯净业务日志
+    Map<String, TestCaseInfo> testCases = new LinkedHashMap<String, TestCaseInfo>();
+    List<String> cleanLogLines = new ArrayList<String>();
+    long suiteDuration = 0;
+
+    for (String line : rawOutput.split("\n")) {
+      String trimmed = line.trim();
+      if (trimmed.startsWith("##teamcity[")) {
+        if (trimmed.startsWith("##teamcity[testStarted")) {
+          Map<String, String> attrs = parseTeamCityAttrs(trimmed);
+          String name = attrs.get("name");
+          if (name != null && !testCases.containsKey(name)) {
+            testCases.put(name, new TestCaseInfo(name));
+          }
+        } else if (trimmed.startsWith("##teamcity[testFinished")) {
+          Map<String, String> attrs = parseTeamCityAttrs(trimmed);
+          String name = attrs.get("name");
+          if (name != null) {
+            TestCaseInfo tc = testCases.get(name);
+            if (tc == null) {
+              tc = new TestCaseInfo(name);
+              testCases.put(name, tc);
+            }
+            String durStr = attrs.get("duration");
+            if (durStr != null) {
+              try { tc.duration = Long.parseLong(durStr); } catch (NumberFormatException ignored) {}
+            }
+          }
+        } else if (trimmed.startsWith("##teamcity[testFailed")) {
+          Map<String, String> attrs = parseTeamCityAttrs(trimmed);
+          String name = attrs.get("name");
+          if (name != null) {
+            TestCaseInfo tc = testCases.get(name);
+            if (tc == null) {
+              tc = new TestCaseInfo(name);
+              testCases.put(name, tc);
+            }
+            tc.status = "FAILED";
+            tc.message = attrs.get("message");
+            tc.details = attrs.get("details");
+            tc.location = extractFailureLocation(tc.details, testClass);
+          }
+        } else if (trimmed.startsWith("##teamcity[testIgnored")) {
+          Map<String, String> attrs = parseTeamCityAttrs(trimmed);
+          String name = attrs.get("name");
+          if (name != null) {
+            TestCaseInfo tc = testCases.get(name);
+            if (tc == null) {
+              tc = new TestCaseInfo(name);
+              testCases.put(name, tc);
+            }
+            tc.status = "IGNORED";
+            tc.message = attrs.get("message");
+          }
+        } else if (trimmed.startsWith("##teamcity[testSuiteFinished")) {
+          Map<String, String> attrs = parseTeamCityAttrs(trimmed);
+          String durStr = attrs.get("duration");
+          if (durStr != null) {
+            try { suiteDuration = Math.max(suiteDuration, Long.parseLong(durStr)); } catch (NumberFormatException ignored) {}
+          }
+        }
+      } else if (!isDiagnosticNoise(trimmed)) {
+        if (!trimmed.isEmpty()) {
+          cleanLogLines.add(line);
+        }
+      }
+    }
+
+    // 4. 统计状态
+    int total = testCases.size();
+    int passed = 0;
+    int failed = 0;
+    int ignored = 0;
+    long totalCaseDuration = 0;
+
+    List<Map<String, Object>> failureList = new ArrayList<Map<String, Object>>();
+    List<Map<String, Object>> testList = new ArrayList<Map<String, Object>>();
+
+    for (TestCaseInfo tc : testCases.values()) {
+      totalCaseDuration += tc.duration;
+      Map<String, Object> tcMap = new LinkedHashMap<String, Object>();
+      tcMap.put("name", tc.name);
+      tcMap.put("status", tc.status);
+      tcMap.put("duration", tc.duration);
+      if ("PASSED".equals(tc.status)) {
+        passed++;
+      } else if ("FAILED".equals(tc.status)) {
+        failed++;
+        if (tc.message != null) tcMap.put("error", tc.message);
+        Map<String, Object> failObj = new LinkedHashMap<String, Object>();
+        failObj.put("test", tc.name);
+        if (tc.message != null) failObj.put("message", tc.message);
+        if (tc.location != null) failObj.put("location", tc.location);
+        if (tc.details != null) failObj.put("details", tc.details);
+        failureList.add(failObj);
+      } else if ("IGNORED".equals(tc.status)) {
+        ignored++;
+      }
+      testList.add(tcMap);
+    }
+
+    long finalDuration = suiteDuration > 0 ? suiteDuration : totalCaseDuration;
+    boolean success = total > 0 ? (failed == 0 && exitCode == 0) : (exitCode == 0);
+
+    // 5. 生成精炼 output
+    StringBuilder outBuilder = new StringBuilder();
+    if (success) {
+      outBuilder.append("✓ All ").append(passed).append(" tests passed");
+      if (finalDuration > 0) outBuilder.append(" (").append(finalDuration).append("ms)");
+      if (!cleanLogLines.isEmpty()) {
+        String remainingLogs = String.join("\n", cleanLogLines);
+        if (remainingLogs.length() <= 2000) {
+          outBuilder.append("\n\n").append(remainingLogs);
+        }
+      }
+    } else {
+      outBuilder.append("✗ Test Failed: ").append(failed).append("/").append(total).append(" tests failed");
+      if (finalDuration > 0) outBuilder.append(" (").append(finalDuration).append("ms)");
+      for (Map<String, Object> fail : failureList) {
+        outBuilder.append("\n\n--- Failure: ").append(fail.get("test")).append(" ---");
+        if (fail.containsKey("location")) outBuilder.append("\nLocation: ").append(fail.get("location"));
+        if (fail.containsKey("message")) outBuilder.append("\nMessage: ").append(fail.get("message"));
+        if (fail.containsKey("details")) {
+          outBuilder.append("\nDetails:\n").append(fail.get("details"));
+        }
+      }
+      if (!cleanLogLines.isEmpty() && failureList.isEmpty()) {
+        outBuilder.append("\n\n").append(String.join("\n", cleanLogLines));
+      }
+    }
+
+    // 6. 构造最终 JSON
     Map<String, Object> result = new LinkedHashMap<String, Object>();
     result.put("success", success);
     result.put("testClass", testClass);
     if (method != null) result.put("method", method);
     result.put("exitCode", exitCode);
-    result.put("output", output);
+    if (total > 0) {
+      result.put("total", total);
+      result.put("passed", passed);
+      result.put("failed", failed);
+      result.put("ignored", ignored);
+      result.put("duration", finalDuration);
+    }
+    if (!failureList.isEmpty()) {
+      result.put("failures", failureList);
+    }
+    if (!testList.isEmpty()) {
+      result.put("tests", testList);
+    }
+    result.put("output", outBuilder.toString());
     result.put("engine", "idea-mcp");
     return json(result);
   }
@@ -863,7 +1328,7 @@ public final class SimpleIde {
     if (command == null || "help".equals(command) || "--help".equals(command) || "-h".equals(command))
       return "用法: simple-ide <command> [options]\n\n命令:\n  open    在 IDEA 中打开项目（IDEA 未运行时自动启动）\n  build   使用 IDEA MCP 编译项目模块\n  run     启动 IDEA Application 配置\n  test    通过 IDEA MCP 执行测试（支持 JUnit 4/5）\n  status  查询应用状态\n  logs    查询应用日志尾部\n  stop    停止应用进程\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
     if ("open".equals(command)) return "用法: simple-ide open --project <path>\n\n在 IDEA 中打开项目。IDEA 未运行时自动启动并等待 MCP 端口就绪。\n";
-    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <name>]\n\n通过 IDEA MCP 编译，需 IDEA 已打开项目且安装 idea-mcp-ext 插件。\n";
+    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <name>] [--no-lock]\n\n通过 IDEA MCP 编译，需 IDEA 已打开项目且安装 idea-mcp-ext 插件。默认启用本地构建排队锁，避免并发编译资源竞争。\n";
     if ("run".equals(command)) return "用法: simple-ide run --project <path> --configuration <name> [--random-port | --port <number>] [--java <path>]\n\n--random-port 自动选择端口并传入 --server.port。\n";
     if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>]\n\n通过 IDEA MCP 运行测试，支持 JUnit 4/5。IDEA 自动识别测试框架。\n";
     if ("status".equals(command)) return "用法: simple-ide status --project <path> --configuration <name>\n";
@@ -951,7 +1416,7 @@ public final class SimpleIde {
   }
 
   /** 构造 Map 的便捷方法（JDK 8 兼容）。 */
-  private static Map<String, Object> mapOf(Object... keyValuePairs) {
+  static Map<String, Object> mapOf(Object... keyValuePairs) {
     Map<String, Object> map = new LinkedHashMap<String, Object>();
     for (int i = 0; i < keyValuePairs.length; i += 2) {
       map.put((String) keyValuePairs[i], keyValuePairs[i + 1]);
@@ -1114,6 +1579,17 @@ public final class SimpleIde {
       value.put("log", log.toString());
       value.put("command", command);
       return value;
+    }
+  }
+
+  /** 表示 IDEA 构建执行的成功状态与诊断结果。 */
+  static final class BuildStatus {
+    final boolean success;
+    final String jsonResult;
+
+    BuildStatus(boolean success, String jsonResult) {
+      this.success = success;
+      this.jsonResult = jsonResult;
     }
   }
 }

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Simple IDE"
+  short_description: "Run, build, test, and manage IDEA projects locally via simple-ide"

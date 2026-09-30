@@ -37,5 +37,5 @@ Maven/Gradle 项目需先拥有外置 JPS 模型。可使用 `--external-config 
 
 ## 分发
 
-运行 `./gradlew test distZip` 后分发 `build/distributions/simple-ide.zip`。解压后使用 `bin/simple-ide-launcher`；它会选择 JDK 17+，也可通过 `SIMPLE_IDE_JAVA_HOME` 明确指定。
+运行 `./gradlew test distZip` 后分发 `build/distributions/simple-ide.zip`。解压后使用 `bin/simple-ide-launcher`（或执行 `./install.sh` 安装）；它会自动探测并运行在 JDK 8+ 上，也可通过 `SIMPLE_IDE_JAVA_HOME` 明确指定。
 # simple-ide

@@ -4,3 +4,4 @@ build/
 .simple-ide/
 **/.simple-ide/
 __pycache__/
+.idea/
