@@ -1,0 +1,219 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>org.jetbrains.jps</groupId>
+    <artifactId>jps-cli</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>1.8</maven.compiler.source>
+        <maven.compiler.target>1.8</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Maven Model Reader -->
+        <dependency>
+            <groupId>org.apache.maven</groupId>
+            <artifactId>maven-model</artifactId>
+            <version>3.8.8</version>
+        </dependency>
+        <dependency>
+            <groupId>org.codehaus.plexus</groupId>
+            <artifactId>plexus-utils</artifactId>
+            <version>3.5.1</version>
+        </dependency>
+
+        <!-- Protobuf -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>2.5.0</version>
+        </dependency>
+
+        <!-- Annotations -->
+        <dependency>
+            <groupId>org.jetbrains</groupId>
+            <artifactId>annotations</artifactId>
+            <version>15.0</version>
+        </dependency>
+
+        <!-- Log4j -->
+        <dependency>
+            <groupId>log4j</groupId>
+            <artifactId>log4j</artifactId>
+            <version>1.2.17</version>
+        </dependency>
+
+        <!-- Netty -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.13.Final</version>
+        </dependency>
+
+        <!-- JDK tools.jar -->
+        <dependency>
+            <groupId>com.sun</groupId>
+            <artifactId>tools</artifactId>
+            <version>1.8.0</version>
+            <scope>system</scope>
+            <systemPath>${java.home}/../lib/tools.jar</systemPath>
+        </dependency>
+
+        <!-- Local JPS libraries -->
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>jps-builders</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/jps-builders.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>jps-model</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/jps-model.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>jps-util</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/util.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>jps-builders-6</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/jps-builders-6.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>asm-all</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/asm-all.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>jdom</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/jdom.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>trove4j</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/trove4j.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>nanoxml</artifactId>
+            <version>2.2.3</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/nanoxml-2.2.3.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>snappy</artifactId>
+            <version>0.5.1</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/snappy-in-java-0.5.1.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>aether-all</artifactId>
+            <version>1.1.0</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/aether-1.1.0-all.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.jps</groupId>
+            <artifactId>aether-dependency-resolver</artifactId>
+            <version>173.4674</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/libs/aether-dependency-resolver.jar</systemPath>
+        </dependency>
+
+        <!-- Test -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- 在 prepare-package 阶段将 libs/*.jar 解压到 target/classes -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <unzip dest="${project.build.outputDirectory}">
+                                    <fileset dir="${project.basedir}/libs">
+                                        <include name="*.jar"/>
+                                    </fileset>
+                                </unzip>
+                                <copy todir="${project.build.outputDirectory}" overwrite="true">
+                                    <fileset dir="${project.basedir}/src/main/resources"/>
+                                </copy>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 使用 maven-shade-plugin 打包 fat-jar -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <finalName>jps-cli</finalName>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>org.jetbrains.jps.cli.JpsCliMain</mainClass>
+                                </transformer>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                            </transformers>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

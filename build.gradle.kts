@@ -7,6 +7,7 @@ repositories {
 }
 
 dependencies {
+  implementation(fileTree("lib") { include("*.jar") })
   implementation("org.junit.platform:junit-platform-launcher:1.11.4")
   implementation("org.junit.jupiter:junit-jupiter-engine:5.11.4")
   implementation("org.junit.vintage:junit-vintage-engine:5.11.4")
@@ -28,6 +29,7 @@ distributions {
         include("INSTALL.md")
         include("README.md")
         include("install.sh")
+        include("install.ps1")
         include("skills/**")
       }
       filesMatching("bin/*") {
@@ -45,5 +47,8 @@ distributions {
 }
 
 tasks.test {
-  useJUnitPlatform()
+  useJUnitPlatform {
+    excludeTags("fixture")
+  }
+  systemProperty("ij.mcp.server.port", "65431")
 }

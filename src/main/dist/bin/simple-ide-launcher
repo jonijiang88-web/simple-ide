@@ -1,17 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+# Resolve symlinks without GNU readlink -f (not provided by macOS).
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
 ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 candidates=("${SIMPLE_IDE_JAVA_HOME:-}" "${JAVA_HOME:-}" "/usr/lib/jvm/java-8-openjdk-amd64" "/usr/lib/jvm/java-1.8.0-openjdk-amd64" "/usr/lib/jvm/java-17-openjdk-amd64" "/usr/lib/jvm/java-1.17.0-openjdk-amd64")
 
+if [[ -x /usr/libexec/java_home ]]; then
+  candidates+=("$(/usr/libexec/java_home 2>/dev/null || true)")
+fi
+if command -v java >/dev/null 2>&1; then
+  JAVA_PATH="$(command -v java)"
+  while [[ -L "$JAVA_PATH" ]]; do
+    JAVA_DIR="$(cd -P "$(dirname "$JAVA_PATH")" && pwd)"
+    JAVA_PATH="$(readlink "$JAVA_PATH")"
+    [[ "$JAVA_PATH" == /* ]] || JAVA_PATH="$JAVA_DIR/$JAVA_PATH"
+  done
+  candidates+=("$(cd "$(dirname "$JAVA_PATH")/.." && pwd)")
+fi
+
 for candidate in "${candidates[@]}"; do
   [[ -x "$candidate/bin/java" ]] || continue
-  version="$($candidate/bin/java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
+  version="$("$candidate/bin/java" -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
   major="${version%%.*}"
   [[ "$major" == "1" ]] && major="${version#1.}" && major="${major%%.*}"
   if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 8 )); then
     export JAVA_HOME="$candidate"
+    export PATH="$JAVA_HOME/bin:$PATH"
     exec "$ROOT/bin/simple-ide" "$@"
   fi
 done

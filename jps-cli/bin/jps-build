@@ -1,0 +1,21 @@
+#!/bin/bash
+# ==============================================================================
+# JPS Incremental Builder CLI Launcher
+# ==============================================================================
+set -e
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JAR_FILE="$DIR/../target/jps-cli.jar"
+
+if [ ! -f "$JAR_FILE" ]; then
+    echo "[ERROR] 未找到 JPS CLI Jar 文件: $JAR_FILE" >&2
+    echo "[INFO]  请先在 tools/jps-cli 下执行 mvn clean package 打包" >&2
+    exit 1
+fi
+
+# 检查/配置 JVM 堆内存（默认 -Xms2g -Xmx10g -XX:+UseG1GC）
+if [ -z "$JAVA_OPTS" ]; then
+    JAVA_OPTS="-Xms2g -Xmx10g -XX:+UseG1GC"
+fi
+
+exec java $JAVA_OPTS -jar "$JAR_FILE" "$@"

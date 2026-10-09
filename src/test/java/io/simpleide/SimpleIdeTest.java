@@ -3,16 +3,22 @@ package io.simpleide;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -45,15 +51,19 @@ public final class SimpleIdeTest {
     assertEquals(Arrays.asList("second", "third"), SimpleIde.tail(file, 2));
   }
 
-  /** 验证帮助信息包含 MCP 端口说明。 */
+  /** 验证帮助信息包含运行时命令说明。 */
   @Test
   void describes_runtime_commands() {
     // 验证：运行帮助说明随机端口参数。
     assertTrue(SimpleIde.helpText("run").contains("--random-port"));
-    // 验证：构建帮助说明 IDEA MCP 编译。
-    assertTrue(SimpleIde.helpText("build").contains("IDEA MCP"));
+    // 验证：运行帮助说明调试端口参数。
+    assertTrue(SimpleIde.helpText("run").contains("--debug-port"));
+    // 验证：构建帮助说明 JPS 增量引擎。
+    assertTrue(SimpleIde.helpText("build").contains("JPS"));
     // 验证：构建帮助说明本地排队锁。
     assertTrue(SimpleIde.helpText("build").contains("本地构建排队锁"));
+    // 验证：测试帮助说明内置 JPS 增量引擎。
+    assertTrue(SimpleIde.helpText("test").contains("JPS"));
     // 验证：顶层帮助列出日志查询命令。
     assertTrue(SimpleIde.helpText(null).contains("logs"));
     // 验证：顶层帮助列出 MCP 端口环境变量。
@@ -379,7 +389,916 @@ public final class SimpleIdeTest {
     // 验证：R 状态取箭头后的新路径，避免把 "old -> new" 整串当作文件路径。
     assertEquals(Arrays.asList("src/B.java"), SimpleIde.parseGitStatusOutput("R  src/A.java -> src/B.java\n"));
   }
+
+  /** 验证 npm 编译结果识别：成功、失败与未知三种情况。 */
+  @Test
+  void detects_npm_compile_status() {
+    // 验证：rspack 成功汇总行判定为 ok。
+    assertEquals("ok", SimpleIde.detectCompileStatus("Rspack compiled successfully in 1.10 s"));
+    // 验证：rspack 报错汇总行判定为 failed。
+    assertEquals("failed", SimpleIde.detectCompileStatus("Rspack compiled with 3 errors in 7.09 s"));
+    // 验证：webpack 报错汇总行同样判定为 failed。
+    assertEquals("failed", SimpleIde.detectCompileStatus("webpack compiled with 2 errors"));
+    // 验证：仅有 Module not found 明细时也判定为 failed。
+    assertEquals("failed", SimpleIde.detectCompileStatus("ERROR in ./client.js\n  Module not found: Can't resolve 'x'"));
+    // 验证：修好后的成功汇总行覆盖先前的报错，最终为 ok。
+    assertEquals("ok", SimpleIde.detectCompileStatus("ERROR in ./a.js\nRspack compiled with 1 error\nRspack compiled successfully in 300 ms"));
+    // 验证：日志中尚无编译结果时返回 null，便于上层标记 unknown。
+    assertNull(SimpleIde.detectCompileStatus("Project is running at: http://127.0.0.1:32937/"));
+  }
+
+  /** 验证编译失败证据优先取 ERROR 明细行。 */
+  @Test
+  void exposes_compile_failure_evidence() {
+    // 验证：同时存在明细与汇总时优先返回 ERROR 明细。
+    assertEquals("ERROR in ./client.js 22:0-70",
+      SimpleIde.lastCompileEvidence("ERROR in ./client.js 22:0-70\nRspack compiled with 3 errors in 7.09 s"));
+    // 验证：无明细时回退到编译汇总行。
+    assertEquals("Rspack compiled with 3 errors in 7.09 s",
+      SimpleIde.lastCompileEvidence("Rspack compiled with 3 errors in 7.09 s"));
+  }
+
+  /** 验证 package.json 依赖解析只取直接依赖键。 */
+  @Test
+  void parses_declared_dependencies() {
+    String packageJson = "{"
+      + "\"name\":\"demo\","
+      + "\"dependencies\":{\"react\":\"^17.0.0\",\"@scope/pkg\":\"^1.0.0\"},"
+      + "\"devDependencies\":{\"vitest\":\"^1.0.0\"},"
+      + "\"scripts\":{\"dev\":\"rspack serve\"}"
+      + "}";
+    List<String> names = SimpleIde.declaredDependencies(packageJson);
+    // 验证：dependencies 与 devDependencies 的直接依赖均被解析。
+    assertTrue(names.containsAll(Arrays.asList("react", "@scope/pkg", "vitest")));
+    // 验证：scripts 等非依赖字段不被计入，且不误取版本号等字符串值。
+    assertEquals(3, names.size());
+  }
+
+  /** 验证依赖缺失检测能定位未安装的直接依赖。 */
+  @Test
+  void reports_missing_npm_dependencies() throws Exception {
+    Path project = Files.createTempDirectory("simple-ide");
+    Files.createDirectories(project.resolve("node_modules/react"));
+    Files.createDirectories(project.resolve("node_modules/@scope/pkg"));
+    String packageJson = "{\"dependencies\":{\"react\":\"^17.0.0\",\"@scope/pkg\":\"^1.0.0\",\"react-helios-kanban-companion\":\"^2.0.1\"}}";
+    // 验证：仅列出 node_modules 中缺失的直接依赖。
+    assertEquals(Arrays.asList("react-helios-kanban-companion"), SimpleIde.missingNpmDependencies(project, packageJson));
+    // 验证：声明齐全且均已安装时返回空列表。
+    assertTrue(SimpleIde.missingNpmDependencies(project, "{\"dependencies\":{\"react\":\"^17.0.0\"}}").isEmpty());
+  }
+
+  /** 验证 npm 依赖校验在缺失时抛出可操作错误。 */
+  @Test
+  void fails_fast_when_dependencies_missing() throws Exception {
+    Path project = Files.createTempDirectory("simple-ide");
+    Files.write(project.resolve("package.json"),
+      "{\"dependencies\":{\"react-helios-kanban-companion\":\"^2.0.1\"}}".getBytes(StandardCharsets.UTF_8));
+    try {
+      SimpleIde.ensureNpmDependencies(project);
+      fail("依赖缺失时应抛出异常");
+    }
+    catch (IllegalStateException expected) {
+      // 验证：错误信息包含缺失包名与 npm install 修复指引。
+      assertTrue(expected.getMessage().contains("react-helios-kanban-companion"));
+      assertTrue(expected.getMessage().contains("npm install"));
+    }
+  }
+
+  /** 验证读取日志末尾字节用于编译判定。 */
+  @Test
+  void reads_log_tail_bytes() throws Exception {
+    Path log = Files.createTempFile("simple-ide", ".log");
+    Files.write(log, "old\nRspack compiled successfully in 1 s\n".getBytes(StandardCharsets.UTF_8));
+    // 验证：末尾截取保留最新编译行，供状态判定使用。
+    assertTrue(SimpleIde.readLogTail(log, 64).contains("compiled successfully"));
+  }
+
+  /** 验证 npm 帮助说明新增的依赖校验与状态语义。 */
+  @Test
+  void describes_npm_safeguards() {
+    // 验证：npm run 帮助说明依赖校验开关。
+    assertTrue(SimpleIde.helpText("npm run").contains("--skip-deps-check"));
+    // 验证：npm status 帮助说明编译失败返回 FAILED。
+    assertTrue(SimpleIde.helpText("npm status").contains("FAILED"));
+  }
+
+  /** 验证能够正确定位内置的 jps-cli.jar 依赖。 */
+  @Test
+  void finds_jps_cli_jar() {
+    // 验证：成功检索到 jps-cli.jar 路径
+    org.junit.jupiter.api.Assertions.assertNotNull(SimpleIde.findJpsCliJar());
+    // 验证：路径对应实际存在的常规文件
+    assertTrue(Files.isRegularFile(SimpleIde.findJpsCliJar()));
+  }
+
+  /** 验证 LocalTestRunner 测试入口类保持稳定。 */
+  @Test
+  void loads_local_test_runner_entrypoint() {
+    // 验证：LocalTestRunner 类可正常加载且全限定名符合预期
+    assertEquals("io.simpleide.LocalTestRunner", LocalTestRunner.class.getName());
+  }
+
+  /** 验证 status 默认使用 local engine 且在无进程时返回 STOPPED，不调用 MCP。 */
+  @Test
+  void status_defaults_to_local_engine_and_returns_stopped() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-status-test");
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"status", "--project", tempProject.toString()});
+    Map<String, Object> result = SimpleIde.queryStatus(cmd);
+
+    // 验证：默认 engine 为 local
+    assertEquals("local", result.get("engine"));
+    // 验证：状态返回 STOPPED
+    assertEquals("STOPPED", result.get("status"));
+    // 验证：running 标记为 false
+    assertEquals(false, result.get("running"));
+  }
+
+  /** 验证 status 在进程已死时自动清理过期状态文件。 */
+  @Test
+  void status_cleans_expired_state_file_when_process_dead() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-status-clean-test");
+    Path stateFile = tempProject.resolve(".simple-ide/runs/Application.properties");
+    Files.createDirectories(stateFile.getParent());
+    Files.write(stateFile, Arrays.asList("9999999", "/tmp/dummy.log", "9999", tempProject.toString(), "java", "-jar", "app.jar"), StandardCharsets.UTF_8);
+
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"status", "--project", tempProject.toString()});
+    Map<String, Object> result = SimpleIde.queryStatus(cmd);
+
+    // 验证：状态返回 STOPPED
+    assertEquals("STOPPED", result.get("status"));
+    // 验证：过期状态文件已被清理
+    assertFalse(Files.exists(stateFile));
+  }
+
+  /** 验证 status --engine idea-mcp 在 MCP 不可用时返回明确错误且不启动 IDEA。 */
+  @Test
+  void status_with_idea_mcp_returns_error_when_unavailable() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-status-mcp-test");
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"status", "--project", tempProject.toString(), "--engine", "idea-mcp"});
+    Map<String, Object> result = SimpleIde.queryStatus(cmd);
+
+    // 验证：执行失败返回 false
+    assertEquals(false, result.get("success"));
+    // 验证：engine 标识为 idea-mcp
+    assertEquals("idea-mcp", result.get("engine"));
+    // 验证：错误信息明确指出 IDEA MCP 未运行
+    assertTrue(((String) result.get("error")).contains("IDEA MCP 未运行"));
+  }
+
+  /** 验证 stop 默认使用 local engine 且在无进程时直接返回已停止，不调用 MCP。 */
+  @Test
+  void stop_defaults_to_local_engine_and_returns_stopped() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-stop-test");
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"stop", "--project", tempProject.toString()});
+    Map<String, Object> result = SimpleIde.executeStop(cmd);
+
+    // 验证：返回已停止标记
+    assertEquals(true, result.get("stopped"));
+    // 验证：默认 engine 为 local
+    assertEquals("local", result.get("engine"));
+  }
+
+  /** 验证 stop 在进程已死时清理过期状态文件。 */
+  @Test
+  void stop_cleans_expired_state_file_when_process_dead() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-stop-clean-test");
+    Path stateFile = tempProject.resolve(".simple-ide/runs/Application.properties");
+    Files.createDirectories(stateFile.getParent());
+    Files.write(stateFile, Arrays.asList("9999999", "/tmp/dummy.log", "9999", tempProject.toString(), "java", "-jar", "app.jar"), StandardCharsets.UTF_8);
+
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"stop", "--project", tempProject.toString()});
+    Map<String, Object> result = SimpleIde.executeStop(cmd);
+
+    // 验证：返回已停止标记
+    assertEquals(true, result.get("stopped"));
+    // 验证：过期状态文件已被清理
+    assertFalse(Files.exists(stateFile));
+  }
+
+  /** 验证 stop --engine idea-mcp 在 MCP 不可用时返回明确错误。 */
+  @Test
+  void stop_with_idea_mcp_returns_error_when_unavailable() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-stop-mcp-test");
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"stop", "--project", tempProject.toString(), "--engine", "idea-mcp"});
+    Map<String, Object> result = SimpleIde.executeStop(cmd);
+
+    // 验证：执行失败返回 false
+    assertEquals(false, result.get("success"));
+    // 验证：engine 标识为 idea-mcp
+    assertEquals("idea-mcp", result.get("engine"));
+    // 验证：错误信息明确指出 IDEA MCP 未运行
+    assertTrue(((String) result.get("error")).contains("IDEA MCP 未运行"));
+  }
+
+  /** 验证 connectMcp 在 MCP 端口不可用时直接返回 null，不自动启动 IDEA。 */
+  @Test
+  void connect_mcp_does_not_start_idea_when_unavailable() {
+    Path tempProject = Paths.get("/tmp");
+    // 验证：未运行 MCP 实例时返回 null，不启动后台进程
+    assertNull(SimpleIde.connectMcp(tempProject));
+  }
+
+  /** 验证常规 run 命令在没有调试参数时默认禁用 JDWP 调试端口（对齐 IDEA Run 纯运行模式）。 */
+  @Test
+  void resolve_debug_port_defaults_to_disabled_in_run() {
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"run", "--project", "/tmp", "--configuration", "App"});
+    int port = SimpleIde.resolveDebugPort(cmd, new ArrayList<String>());
+    // 验证：常规 run 命令默认返回 -1，不挂 JDWP 调试代理
+    assertEquals(-1, port);
+  }
+
+  /** 验证 debug 子命令默认启用 JDWP 调试端口 5005（对齐 IDEA Debug 模式）。 */
+  @Test
+  void resolve_debug_port_defaults_to_5005_in_debug_command() {
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"debug", "--project", "/tmp", "--configuration", "App"});
+    int port = SimpleIde.resolveDebugPort(cmd, new ArrayList<String>());
+    // 验证：debug 命令默认 JDWP 调试端口为 5005
+    assertEquals(5005, port);
+  }
+
+  /** 验证 run 命令显式添加 --debug 参数时启用 JDWP 调试端口 5005。 */
+  @Test
+  void resolve_debug_port_defaults_to_5005_in_run_with_debug_flag() {
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"run", "--project", "/tmp", "--configuration", "App", "--debug"});
+    int port = SimpleIde.resolveDebugPort(cmd, new ArrayList<String>());
+    // 验证：run --debug 启用 JDWP 调试端口 5005
+    assertEquals(5005, port);
+  }
+
+  /** 验证指定 --debug-port 时优先使用指定端口。 */
+  @Test
+  void resolve_debug_port_custom_port() {
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"run", "--project", "/tmp", "--configuration", "App", "--debug-port", "5008"});
+    int port = SimpleIde.resolveDebugPort(cmd, new ArrayList<String>());
+    // 验证：使用指定的自定义调试端口 5008
+    assertEquals(5008, port);
+  }
+
+  /** 验证指定 --no-debug 时禁用调试端口。 */
+  @Test
+  void resolve_debug_port_disabled_by_flag() {
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"debug", "--project", "/tmp", "--configuration", "App", "--no-debug"});
+    int port = SimpleIde.resolveDebugPort(cmd, new ArrayList<String>());
+    // 验证：指定 --no-debug 时返回 -1 表示不开启调试
+    assertEquals(-1, port);
+  }
+
+  /** 验证已在 VM 参数中配置 JDWP 时能够解析已有端口。 */
+  @Test
+  void resolve_debug_port_parses_existing_vm_param() {
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"run", "--project", "/tmp", "--configuration", "App"});
+    List<String> vmParams = Arrays.asList("-Xmx2g", "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5010");
+    int port = SimpleIde.resolveDebugPort(cmd, vmParams);
+    // 验证：从已有的 JDWP vm 参数中提取出端口 5010
+    assertEquals(5010, port);
+  }
+
+  /** 验证 debug 模式下默认 5005 端口被占用时自动分配新的可用调试端口。 */
+  @Test
+  void resolve_debug_port_allocates_new_port_when_5005_occupied() throws Exception {
+    try (ServerSocket occupied = new ServerSocket(5005)) {
+      SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"debug", "--project", "/tmp", "--configuration", "App"});
+      int port = SimpleIde.resolveDebugPort(cmd, new ArrayList<String>());
+      // 验证：分配的端口有效且大于 0
+      assertTrue(port > 0 && port <= 65535);
+      // 验证：分配的端口避开了被占用的 5005 端口
+      assertTrue(port != 5005);
+    }
+  }
+
+  /** 验证 queryStatus 本地模式返回包含自动分配的 debugPort。 */
+  @Test
+  void query_status_returns_debug_port() throws Exception {
+    Path tempProject = Files.createTempDirectory("simple-ide-status-debug-port-test");
+    Path stateFile = tempProject.resolve(".simple-ide/runs/Application.properties");
+    Files.createDirectories(stateFile.getParent());
+    SimpleIde.RunState state = new SimpleIde.RunState(9999999, Paths.get("/tmp/app.log"), 8080, 5066, tempProject.toString(), Arrays.asList("java", "Main"));
+    state.write(stateFile);
+
+    // 启动临时子进程获取真实存活 PID
+    Process dummyProcess = new ProcessBuilder("sleep", "10").start();
+    try {
+      long alivePid = SimpleIde.getPid(dummyProcess);
+      SimpleIde.RunState aliveState = new SimpleIde.RunState(alivePid, Paths.get("/tmp/app.log"), 8080, 5066, tempProject.toString(), Arrays.asList("java", "Main"));
+      aliveState.write(stateFile);
+
+      SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"status", "--project", tempProject.toString()});
+      Map<String, Object> statusResult = SimpleIde.queryStatus(cmd);
+
+      // 验证：状态返回中包含 debugPort
+      assertEquals(5066, statusResult.get("debugPort"));
+    } finally {
+      dummyProcess.destroy();
+    }
+  }
+
+  /** 验证默认注入的 JDWP 参数使用 Java 8 也能识别的端口写法。 */
+  @Test
+  void build_java_command_line_injects_default_jdwp() {
+    List<String> command = SimpleIde.buildJavaCommandLine(
+        "java",
+        Arrays.asList("-Xms512m"),
+        5005,
+        "/tmp/classes",
+        "com.example.Main",
+        8080,
+        Arrays.asList("--arg1=val1")
+    );
+    // 验证：命令行包含 setsid
+    assertEquals("setsid", command.get(0));
+    // 验证：命令行包含 java 可执行程序
+    assertEquals("java", command.get(1));
+    // 验证：命令行包含原始 VM 参数
+    assertTrue(command.contains("-Xms512m"));
+    // 验证：自动生成的 JDWP 参数不使用 Java 8 无法解析的通配地址。
+    assertTrue(command.contains("-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005"));
+    // 验证：命令行包含类路径参数
+    assertTrue(command.contains("-cp"));
+    // 验证：命令行包含主类
+    assertTrue(command.contains("com.example.Main"));
+    // 验证：命令行包含服务端口
+    assertTrue(command.contains("--server.port=8080"));
+    // 验证：命令行包含应用程序参数
+    assertTrue(command.contains("--arg1=val1"));
+  }
+
+  /** 验证已有 JDWP 参数时 buildJavaCommandLine 不重复注入。 */
+  @Test
+  void build_java_command_line_skips_duplicate_jdwp() {
+    String existingJdwp = "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5007";
+    List<String> command = SimpleIde.buildJavaCommandLine(
+        "java",
+        Arrays.asList("-Xms512m", existingJdwp),
+        5007,
+        null,
+        "com.example.Main",
+        -1,
+        null
+    );
+    long jdwpCount = command.stream().filter(s -> s.contains("-agentlib:jdwp")).count();
+    // 验证：即使指定了 debugPort，由于已有 JDWP 配置，不产生重复 JDWP 参数
+    assertEquals(1, jdwpCount);
+  }
+
+  /** 验证 RunState 支持写入、读取并在 toMap 中包含 debugPort。 */
+  @Test
+  void run_state_persists_and_exposes_debug_port() throws Exception {
+    Path tempFile = Files.createTempFile("run-state-test", ".properties");
+    SimpleIde.RunState state = new SimpleIde.RunState(12345, Paths.get("/tmp/app.log"), 8080, 5005, "/tmp/project", Arrays.asList("java", "Main"));
+    state.write(tempFile);
+
+    SimpleIde.RunState readBack = SimpleIde.RunState.read(tempFile);
+    // 验证：正确反序列化 pid
+    assertEquals(12345L, readBack.pid);
+    // 验证：正确反序列化 server port
+    assertEquals(8080, readBack.port);
+    // 验证：正确反序列化 debug port
+    assertEquals(5005, readBack.debugPort);
+    // 验证：正确反序列化 projectPath
+    assertEquals("/tmp/project", readBack.projectPath);
+
+    Map<String, Object> map = readBack.toMap("RUNNING");
+    // 验证：toMap 中输出 debugPort 属性
+    assertEquals(5005, map.get("debugPort"));
+  }
+
+  /** 验证 RunState 兼容不带 debugPort 的旧格式状态文件。 */
+  @Test
+  void run_state_backward_compatible_with_old_format() throws Exception {
+    Path tempFile = Files.createTempFile("run-state-old", ".properties");
+    // 旧格式仅 5 行：pid, log, port, projectPath, command...
+    Files.write(tempFile, Arrays.asList(
+        "23456",
+        "/tmp/old.log",
+        "8081",
+        "/tmp/old-project",
+        "java",
+        "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5009",
+        "com.example.Main"
+    ), StandardCharsets.UTF_8);
+
+    SimpleIde.RunState readBack = SimpleIde.RunState.read(tempFile);
+    // 验证：正确反序列化旧文件 pid
+    assertEquals(23456L, readBack.pid);
+    // 验证：正确反序列化旧文件 server port
+    assertEquals(8081, readBack.port);
+    // 验证：从旧文件命令行中成功识别 fallback debug port 5009
+    assertEquals(5009, readBack.debugPort);
+    // 验证：正确反序列化旧文件 projectPath
+    assertEquals("/tmp/old-project", readBack.projectPath);
+  }
+
+  /** 用于验证多项失败捕获能力的示例测试用例固件。 */
+  @org.junit.jupiter.api.Tag("fixture")
+  public static class MultiFailureSampleFixture {
+    /** 正常通过用例。 */
+    @Test
+    void testPass() {
+      // 验证：测试正常通过
+      assertTrue(true);
+    }
+
+    /** 比较断言失败用例。 */
+    @Test
+    void testFailOne() {
+      // 验证：断言失败抛出异常
+      assertEquals("expected1", "actual1", "断言失败一");
+    }
+
+    /** 运行时异常失败用例。 */
+    @Test
+    void testFailTwo() {
+      // 验证：显式抛出运行时异常
+      throw new IllegalStateException("运行时异常失败二");
+    }
+  }
+
+  /** 验证 LocalTestRunner 能够捕获所有失败用例（不仅是第一个）及其方法名与完整堆栈。 */
+  @Test
+  void local_test_runner_captures_all_failures_with_full_details() {
+    Map<String, Object> result = LocalTestRunner.executeTests(MultiFailureSampleFixture.class.getName(), null);
+
+    // 验证：执行结果标记为失败
+    assertFalse((Boolean) result.get("success"));
+    // 验证：进程退出码应为 1
+    assertEquals(1, ((Number) result.get("exitCode")).intValue());
+    // 验证：总用例数为 3
+    assertEquals(3L, ((Number) result.get("total")).longValue());
+    // 验证：通过用例数为 1
+    assertEquals(1L, ((Number) result.get("passed")).longValue());
+    // 验证：失败用例数为 2
+    assertEquals(2L, ((Number) result.get("failed")).longValue());
+
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> failures = (List<Map<String, Object>>) result.get("failures");
+    // 验证：失败列表中包含全部 2 个失败，而不是仅有第 1 个
+    assertEquals(2, failures.size());
+
+    // 验证：第 1 个失败包含方法名 testFailOne
+    assertTrue(failures.get(0).get("test").toString().contains("testFailOne"));
+    // 验证：第 1 个失败包含断言提示信息
+    assertTrue(failures.get(0).get("message").toString().contains("断言失败一"));
+    // 验证：第 1 个失败包含完整堆栈信息
+    assertTrue(failures.get(0).get("details").toString().contains("AssertionFailedError") || failures.get(0).get("details").toString().contains("AssertionError"));
+
+    // 验证：第 2 个失败包含方法名 testFailTwo
+    assertTrue(failures.get(1).get("test").toString().contains("testFailTwo"));
+    // 验证：第 2 个失败包含运行时异常信息
+    assertTrue(failures.get(1).get("message").toString().contains("运行时异常失败二"));
+    // 验证：第 2 个失败包含完整堆栈信息
+    assertTrue(failures.get(1).get("details").toString().contains("IllegalStateException"));
+  }
+
+  /** 验证生成测试报告文件，并向返回结果中注入 reportFile 绝对路径。 */
+  @Test
+  void writes_test_report_file_and_injects_path() throws Exception {
+    Path tempDir = Files.createTempDirectory("simple-ide-report-test");
+    Map<String, Object> testResult = new java.util.LinkedHashMap<String, Object>();
+    testResult.put("success", false);
+    testResult.put("testClass", "com.example.DemoTest");
+    testResult.put("total", 2);
+    testResult.put("failed", 1);
+
+    Path reportFile = SimpleIde.writeTestReport(tempDir, "com.example.DemoTest", testResult);
+    // 验证：返回的带时间戳报告文件存在且为常规文件
+    assertTrue(Files.isRegularFile(reportFile));
+    // 验证：最新报告固定文件 test-report.json 存在
+    assertTrue(Files.isRegularFile(tempDir.resolve(".simple-ide/reports/test-report.json")));
+    // 验证：testResult 注入了 reportFile 绝对路径
+    assertEquals(reportFile.toAbsolutePath().toString(), testResult.get("reportFile"));
+
+    // 验证：报告文件内容为完整 JSON，包含测试类与失败统计
+    String content = new String(Files.readAllBytes(reportFile), StandardCharsets.UTF_8);
+    // 验证：包含失败用例统计数字
+    assertTrue(content.contains("\"failed\":1"));
+    // 验证：包含目标测试类名
+    assertTrue(content.contains("com.example.DemoTest"));
+  }
+
+  /** 验证从 JSON 字符串中注入 reportFile 并成功写入落盘文件。 */
+  @Test
+  void attach_report_file_and_write_injects_report_file() throws Exception {
+    Path tempDir = Files.createTempDirectory("simple-ide-attach-test");
+    String rawJson = "{\"success\":false,\"testClass\":\"com.example.FooTest\",\"failed\":3}";
+    String finalJson = SimpleIde.attachReportFileAndWrite(tempDir, "com.example.FooTest", rawJson);
+
+    // 验证：返回的 JSON 中注入了 reportFile 字段
+    assertTrue(finalJson.contains("\"reportFile\":"));
+    // 验证：固定测试报告文件被创建
+    Path latestReport = tempDir.resolve(".simple-ide/reports/test-report.json");
+    assertTrue(Files.isRegularFile(latestReport));
+    // 验证：写入文件的内容与返回的 finalJson 一致
+    String content = new String(Files.readAllBytes(latestReport), StandardCharsets.UTF_8);
+    assertEquals(finalJson, content);
+  }
+
+  /** 验证 MCP 模式在有多个失败用例时，完整保留并暴露所有失败方法名与堆栈。 */
+  @Test
+  void parses_multiple_failed_teamcity_test_results_with_full_details() {
+    String stack1 = "org.junit.ComparisonFailure: expected:<[a]> but was:<[b]>\n"
+      + "\tat com.example.DemoTest.testFail1(DemoTest.java:42)\n";
+    String stack2 = "java.lang.NullPointerException: NPE occurred\n"
+      + "\tat com.example.DemoTest.testFail2(DemoTest.java:55)\n";
+
+    String rawOutput = "##teamcity[enteredTheMatrix]\n"
+      + "##teamcity[testStarted name='DemoTest.testFail1']\n"
+      + "##teamcity[testFailed name='DemoTest.testFail1' message='expected:<[a]> but was:<[b]>' details='" + stack1.replace("\n", "|n") + "']\n"
+      + "##teamcity[testFinished name='DemoTest.testFail1' duration='20']\n"
+      + "##teamcity[testStarted name='DemoTest.testFail2']\n"
+      + "##teamcity[testFailed name='DemoTest.testFail2' message='NPE occurred' details='" + stack2.replace("\n", "|n") + "']\n"
+      + "##teamcity[testFinished name='DemoTest.testFail2' duration='15']\n";
+
+    String mcpJson = "{\"exitCode\":1,\"output\":\"" + rawOutput.replace("\n", "\\n").replace("\"", "\\\"").replace("'", "\\'") + "\"}";
+    String result = SimpleIde.mcpTestResultToJson(mcpJson, "com.example.DemoTest", null);
+
+    // 验证：测试执行状态为失败
+    assertTrue(result.contains("\"success\":false"));
+    // 验证：解析出总失败数为 2
+    assertTrue(result.contains("\"failed\":2"));
+    // 验证：包含第一个失败的方法名
+    assertTrue(result.contains("DemoTest.testFail1"));
+    // 验证：包含第一个失败的行号定位
+    assertTrue(result.contains("DemoTest.java:42"));
+    // 验证：包含第二个失败的方法名
+    assertTrue(result.contains("DemoTest.testFail2"));
+    // 验证：包含第二个失败的行号定位
+    assertTrue(result.contains("DemoTest.java:55"));
+    // 验证：包含第二个失败的异常类型
+    assertTrue(result.contains("NullPointerException"));
+  }
+
+  /** 验证命令历史的记录与读取。 */
+  @Test
+  void records_and_reads_command_history() throws Exception {
+    Path tempDir = Files.createTempDirectory("simple-ide-history-test");
+    SimpleIde.recordCommand(tempDir, "build", "--project /tmp/demo --timeout 300", true, 1250, "Build succeeded in 1250ms");
+    SimpleIde.recordCommand(tempDir, "test", "--project /tmp/demo --class com.example.FooTest", false, 450, "✗ 2 tests failed");
+
+    List<Map<String, Object>> history = SimpleIde.readCommandHistory(tempDir, 10);
+    // 验证：历史记录数量为 2
+    assertEquals(2, history.size());
+    // 验证：最新的记录排在最前面
+    assertEquals("test", history.get(0).get("command"));
+    // 验证：最新记录的执行状态为失败
+    assertEquals(false, history.get(0).get("success"));
+    // 验证：第一条记录的命令为 build
+    assertEquals("build", history.get(1).get("command"));
+    // 验证：第一条记录执行状态为成功
+    assertEquals(true, history.get(1).get("success"));
+  }
+
+  /** 验证 generateHtmlReport 生成包含关联应用、命令历史与测试结果的完整 HTML 报告。 */
+  @Test
+  void generates_html_report_with_applications_history_and_results() throws Exception {
+    Path tempDir = Files.createTempDirectory("simple-ide-html-test");
+
+    // 1. 创建关联应用状态
+    Path runDir = tempDir.resolve(".simple-ide/runs");
+    Files.createDirectories(runDir);
+    Path stateFile = runDir.resolve("OrderService.properties");
+    new SimpleIde.RunState(
+      12345L,
+      runDir.resolve("OrderService.log"),
+      8080,
+      5005,
+      tempDir.toString(),
+      Arrays.asList("java", "-jar", "app.jar")
+    ).write(stateFile);
+
+    // 2. 创建测试报告
+    Path reportDir = tempDir.resolve(".simple-ide/reports");
+    Files.createDirectories(reportDir);
+    String testReportJson = "{\"success\":false,\"testClass\":\"com.example.OrderTest\",\"total\":10,\"passed\":8,\"failed\":2,\"duration\":350,\"failures\":[{\"test\":\"testTimeout\",\"message\":\"Timed out waiting for ACK\"}]}";
+    Files.write(reportDir.resolve("test-report.json"), testReportJson.getBytes(StandardCharsets.UTF_8));
+
+    // 3. 记录命令历史
+    SimpleIde.recordCommand(tempDir, "run", "--configuration OrderService --port 8080", true, 500, "Started on port 8080");
+
+    // 4. 生成 HTML 报告
+    Path htmlReport = SimpleIde.generateHtmlReport(tempDir);
+    // 验证：HTML 文件被成功创建
+    assertTrue(Files.isRegularFile(htmlReport));
+
+    String html = new String(Files.readAllBytes(htmlReport), StandardCharsets.UTF_8);
+    // 验证：HTML 包含 Simple IDE 标识
+    assertTrue(html.contains("Simple IDE"));
+    // 验证：HTML 包含关联应用名称 OrderService
+    assertTrue(html.contains("OrderService"));
+    // 验证：HTML 包含应用端口 8080
+    assertTrue(html.contains("8080"));
+    // 验证：HTML 包含调试端口 5005
+    assertTrue(html.contains("5005"));
+    // 验证：HTML 包含测试报告类名与失败统计
+    assertTrue(html.contains("com.example.OrderTest"));
+    assertTrue(html.contains("Timed out waiting for ACK"));
+    // 验证：HTML 包含命令历史
+    assertTrue(html.contains("--configuration OrderService"));
+  }
+
+  /** 验证 helpText 中包含 report 命令说明。 */
+  @Test
+  void describes_report_command_in_help() {
+    // 验证：report 命令独立帮助文本
+    assertTrue(SimpleIde.helpText("report").contains("report"));
+    // 验证：帮助文本说明生成 HTML 报告
+    assertTrue(SimpleIde.helpText("report").contains("HTML"));
+    // 验证：全局帮助列出 report 命令
+    assertTrue(SimpleIde.helpText(null).contains("report"));
+  }
+
+  /** 验证动态管理 HTTP 服务提供页面与实时 API 交互。 */
+  @Test
+  void dashboard_server_serves_html_and_api() throws Exception {
+    Path tempDir = Files.createTempDirectory("simple-ide-server-test");
+
+    // 1. 创建应用配置与日志
+    Path runDir = tempDir.resolve(".simple-ide/runs");
+    Files.createDirectories(runDir);
+    Path logFile = runDir.resolve("PayService.log");
+    Files.write(logFile, Arrays.asList("Spring Boot started on 9090", "Ready to serve traffic"), StandardCharsets.UTF_8);
+    Path stateFile = runDir.resolve("PayService.properties");
+    new SimpleIde.RunState(
+      99999L,
+      logFile,
+      9090,
+      5005,
+      tempDir.toString(),
+      Arrays.asList("java", "-jar", "pay.jar")
+    ).write(stateFile);
+
+    // 2. 写入测试报告与命令历史
+    Path reportDir = tempDir.resolve(".simple-ide/reports");
+    Files.createDirectories(reportDir);
+    Files.write(reportDir.resolve("test-report.json"), "{\"success\":true,\"testClass\":\"com.example.PayTest\",\"total\":5,\"passed\":5,\"failed\":0,\"duration\":120}".getBytes(StandardCharsets.UTF_8));
+    SimpleIde.recordCommand(tempDir, "build", "--project /tmp/pay", true, 800, "Build OK");
+
+    // 3. 启动管理服务
+    int port = SimpleIde.findAvailablePort();
+    SimpleIde.DashboardServer server = SimpleIde.startDashboardServer(tempDir, port);
+    try {
+      // 4. 请求 GET /
+      java.net.HttpURLConnection connHtml = (java.net.HttpURLConnection) new java.net.URL("http://localhost:" + port + "/").openConnection();
+      // 验证：首页返回 HTTP 200
+      assertEquals(200, connHtml.getResponseCode());
+      String html = new String(SimpleIde.readAllBytes(connHtml.getInputStream()), StandardCharsets.UTF_8);
+      // 验证：首页包含动态管理控制台标识
+      assertTrue(html.contains("Simple IDE"));
+      // 验证：首页包含应用名称
+      assertTrue(html.contains("PayService"));
+      // 验证：首页包含自动轮询与 API 调用逻辑
+      assertTrue(html.contains("/api/status"));
+
+      // 5. 请求 GET /api/status
+      java.net.HttpURLConnection connStatus = (java.net.HttpURLConnection) new java.net.URL("http://localhost:" + port + "/api/status").openConnection();
+      // 验证：API 状态接口返回 HTTP 200
+      assertEquals(200, connStatus.getResponseCode());
+      String statusJson = new String(SimpleIde.readAllBytes(connStatus.getInputStream()), StandardCharsets.UTF_8);
+      // 验证：JSON 包含关联应用 PayService
+      assertTrue(statusJson.contains("PayService"));
+      // 验证：JSON 包含测试报告 PayTest
+      assertTrue(statusJson.contains("PayTest"));
+      // 验证：JSON 包含历史命令 build
+      assertTrue(statusJson.contains("build"));
+
+      // 6. 请求 GET /api/logs
+      java.net.HttpURLConnection connLogs = (java.net.HttpURLConnection) new java.net.URL("http://localhost:" + port + "/api/logs?configuration=PayService&tail=10").openConnection();
+      // 验证：日志接口返回 HTTP 200
+      assertEquals(200, connLogs.getResponseCode());
+      String logsJson = new String(SimpleIde.readAllBytes(connLogs.getInputStream()), StandardCharsets.UTF_8);
+      // 验证：日志接口成功返回日志文本内容
+      assertTrue(logsJson.contains("Spring Boot started on 9090"));
+    } finally {
+      server.stop();
+    }
+  }
+
+  /** 验证 helpText 中已移除 open 命令并增加了 list 命令说明。 */
+  @Test
+  void describes_list_command_and_removes_open_in_help() {
+    String globalHelp = SimpleIde.helpText(null);
+    // 验证：全局帮助中不再包含 open 命令
+    assertFalse(globalHelp.contains("  open    "));
+    // 验证：全局帮助中包含 list 命令
+    assertTrue(globalHelp.contains("  list    "));
+
+    // 验证：list 命令独立帮助文本包含用法说明
+    String listHelp = SimpleIde.helpText("list");
+    // 验证：list 帮助文本包含项目参数
+    assertTrue(listHelp.contains("--project"));
+    // 验证：list 帮助文本包含集中管控说明
+    assertTrue(listHelp.contains("集中管控") || listHelp.contains("列出"));
+
+    // 验证：单独查询 open 帮助返回未知命令
+    String openHelp = SimpleIde.helpText("open");
+    // 验证：open 不再作为合法命令
+    assertTrue(openHelp.contains("未知命令"));
+  }
+
+  /** 验证 list 命令能够跨项目集中收集所有启动的应用。 */
+  @Test
+  void list_apps_across_projects() throws Exception {
+    Path projectA = Files.createTempDirectory("project-a");
+    Path projectB = Files.createTempDirectory("project-b");
+
+    // 1. 在 projectA 下写入 Java 应用状态
+    Path runDirA = projectA.resolve(".simple-ide/runs");
+    Files.createDirectories(runDirA);
+    Path logA = runDirA.resolve("OrderServiceA.log");
+    Files.write(logA, Arrays.asList("Order Service Started"), StandardCharsets.UTF_8);
+    Path stateA = runDirA.resolve("OrderServiceA.properties");
+    new SimpleIde.RunState(11111L, logA, 8081, 5005, projectA.toString(), Arrays.asList("java", "-jar", "order.jar")).write(stateA);
+
+    // 2. 在 projectB 下写入 npm 服务状态
+    Path runDirB = projectB.resolve(".simple-ide/runs");
+    Files.createDirectories(runDirB);
+    Path logB = runDirB.resolve("npm-dev-b.log");
+    Files.write(logB, Arrays.asList("Vite ready on port 3000"), StandardCharsets.UTF_8);
+    Path stateB = runDirB.resolve("npm-dev-b.properties");
+    new SimpleIde.RunState(22222L, logB, 3000, -1, projectB.toString(), Arrays.asList("npm", "run", "dev")).write(stateB);
+
+    // 3. 注册两个项目到全局注册表
+    SimpleIde.registerProject(projectA);
+    SimpleIde.registerProject(projectB);
+
+    // 4. 执行 list 查询全局应用
+    SimpleIde.Command cmdGlobal = SimpleIde.Command.parse(new String[]{"list"});
+    Map<String, Object> globalResult = SimpleIde.listApps(cmdGlobal);
+
+    // 验证：全局 list 调用成功
+    assertEquals(Boolean.TRUE, globalResult.get("success"));
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> apps = (List<Map<String, Object>>) globalResult.get("apps");
+    // 验证：包含至少 2 个应用
+    assertTrue(apps.size() >= 2);
+
+    boolean foundOrder = false;
+    boolean foundNpm = false;
+    for (Map<String, Object> app : apps) {
+      if ("OrderServiceA".equals(app.get("configuration"))) {
+        foundOrder = true;
+        // 验证：OrderServiceA 类型识别为 java
+        assertEquals("java", app.get("type"));
+        // 验证：OrderServiceA 端口为 8081
+        assertEquals(8081, app.get("port"));
+        // 验证：OrderServiceA 调试端口为 5005
+        assertEquals(5005, app.get("debugPort"));
+      } else if ("npm-dev-b".equals(app.get("configuration"))) {
+        foundNpm = true;
+        // 验证：npm-dev-b 类型识别为 npm
+        assertEquals("npm", app.get("type"));
+        // 验证：npm-dev-b 端口为 3000
+        assertEquals(3000, app.get("port"));
+      }
+    }
+    // 验证：全局清单中成功匹配到 OrderServiceA
+    assertTrue(foundOrder);
+    // 验证：全局清单中成功匹配到 npm-dev-b
+    assertTrue(foundNpm);
+
+    // 5. 指定 --project 时仅返回该项目的应用
+    SimpleIde.Command cmdProjectA = SimpleIde.Command.parse(new String[]{"list", "--project", projectA.toString()});
+    Map<String, Object> resultA = SimpleIde.listApps(cmdProjectA);
+    // 验证：指定项目 A 查询成功
+    assertEquals(Boolean.TRUE, resultA.get("success"));
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> appsA = (List<Map<String, Object>>) resultA.get("apps");
+    // 验证：项目 A 仅有 1 个应用
+    assertEquals(1, appsA.size());
+    // 验证：该应用为 OrderServiceA
+    assertEquals("OrderServiceA", appsA.get(0).get("configuration"));
+  }
+
+  /** 验证 list 命令能够返回正在使用 simple-ide 的活跃工程目录清单。 */
+  @Test
+  void list_includes_active_projects_summary() throws Exception {
+    Path project = Files.createTempDirectory("project-active-dirs");
+
+    // 1. 在项目中写入运行中应用配置
+    Path runDir = project.resolve(".simple-ide/runs");
+    Files.createDirectories(runDir);
+    Path logFile = runDir.resolve("PayApp.log");
+    Files.write(logFile, Arrays.asList("Started PayApp"), StandardCharsets.UTF_8);
+    Path stateFile = runDir.resolve("PayApp.properties");
+    new SimpleIde.RunState(88888L, logFile, 8099, -1, project.toString(), Arrays.asList("java", "-jar", "pay.jar")).write(stateFile);
+
+    // 2. 显式注册该项目
+    SimpleIde.registerProject(project);
+
+    // 3. 执行 list 命令
+    SimpleIde.Command cmd = SimpleIde.Command.parse(new String[]{"list"});
+    Map<String, Object> result = SimpleIde.listApps(cmd);
+
+    // 验证：返回结果成功
+    assertEquals(Boolean.TRUE, result.get("success"));
+    // 验证：返回结果中包含 activeProjects 列表
+    assertTrue(result.containsKey("activeProjects"));
+    @SuppressWarnings("unchecked")
+    List<Map<String, Object>> activeProjects = (List<Map<String, Object>>) result.get("activeProjects");
+    // 验证：activeProjects 列表非空
+    assertFalse(activeProjects.isEmpty());
+
+    boolean foundProject = false;
+    for (Map<String, Object> projInfo : activeProjects) {
+      if (project.toAbsolutePath().toString().equals(projInfo.get("projectPath"))) {
+        foundProject = true;
+        // 验证：项目元数据包含应用数量统计
+        assertTrue(projInfo.containsKey("totalApps"));
+      }
+    }
+    // 验证：在活跃项目列表中找到了当前测试项目
+    assertTrue(foundProject);
+  }
+
+  /** 验证 discoverActiveProjects 在跨平台或非 Linux 环境下安全执行不抛出任何异常。 */
+  @Test
+  void discover_active_projects_is_safe_across_platforms() {
+    Map<Path, List<Map<String, Object>>> cliOut = new LinkedHashMap<Path, List<Map<String, Object>>>();
+    // 验证：调用进程探测安全执行，绝不抛出任何异常
+    assertDoesNotThrow(() -> {
+      Set<Path> paths = SimpleIde.discoverActiveProjects(cliOut);
+      // 验证：返回结果不为 null
+      assertNotNull(paths);
+    });
+  }
+
+  /** 验证动态管理控制台即使在未启动应用的工程中打开，也能集中展示全系统其他工程启动的应用与实时日志。 */
+  @Test
+  void dashboard_server_discovers_cross_project_apps() throws Exception {
+    Path emptyProject = Files.createTempDirectory("dashboard-empty-proj");
+    Path appProject = Files.createTempDirectory("dashboard-app-proj");
+
+    // 1. 在 appProject 下写入一个应用
+    Path runDir = appProject.resolve(".simple-ide/runs");
+    Files.createDirectories(runDir);
+    Path logFile = runDir.resolve("CrossService.log");
+    Files.write(logFile, Arrays.asList("Cross service listening on 7070"), StandardCharsets.UTF_8);
+    Path stateFile = runDir.resolve("CrossService.properties");
+    new SimpleIde.RunState(77777L, logFile, 7070, -1, appProject.toString(), Arrays.asList("java", "-jar", "cross.jar")).write(stateFile);
+    SimpleIde.registerProject(appProject);
+
+    // 2. 在空工程 emptyProject 下启动 DashboardServer
+    int port = SimpleIde.findAvailablePort();
+    SimpleIde.DashboardServer server = SimpleIde.startDashboardServer(emptyProject, port);
+    try {
+      // 3. 请求 GET /api/status
+      java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL("http://localhost:" + port + "/api/status").openConnection();
+      // 验证：状态接口响应 HTTP 200
+      assertEquals(200, conn.getResponseCode());
+      String json = new String(SimpleIde.readAllBytes(conn.getInputStream()), StandardCharsets.UTF_8);
+      // 验证：在空工程的控制台接口中成功返回了外部工程的 CrossService
+      assertTrue(json.contains("CrossService"));
+      // 验证：返回结果包含了外部工程路径
+      assertTrue(json.contains(appProject.toAbsolutePath().toString()));
+
+      // 4. 请求 GET /api/logs，带 projectPath
+      java.net.HttpURLConnection logConn = (java.net.HttpURLConnection) new java.net.URL("http://localhost:" + port + "/api/logs?configuration=CrossService&projectPath=" + java.net.URLEncoder.encode(appProject.toAbsolutePath().toString(), "UTF-8")).openConnection();
+      // 验证：日志接口响应 HTTP 200
+      assertEquals(200, logConn.getResponseCode());
+      String logsJson = new String(SimpleIde.readAllBytes(logConn.getInputStream()), StandardCharsets.UTF_8);
+      // 验证：成功获取外部工程的日志内容
+      assertTrue(logsJson.contains("Cross service listening on 7070"));
+    } finally {
+      server.stop();
+    }
+  }
+
+  /** 验证 extractProjectFromCmdline 能够正确提取 --project 与 -Duser.dir 路径。 */
+  @Test
+  void extract_project_from_cmdline_parses_path() throws Exception {
+    Path tempDir = Files.createTempDirectory("extract-cmdline-test");
+    String cmdWithProject = "java SimpleIde run --project " + tempDir.toAbsolutePath();
+    Path extracted1 = SimpleIde.extractProjectFromCmdline(cmdWithProject);
+    // 验证：成功从 --project 提取出有效项目路径
+    assertNotNull(extracted1);
+    // 验证：提取的项目路径与预期一致
+    assertEquals(tempDir.toAbsolutePath().normalize(), extracted1);
+
+    String cmdWithUserDir = "java -Duser.dir=" + tempDir.toAbsolutePath() + " Application";
+    Path extracted2 = SimpleIde.extractProjectFromCmdline(cmdWithUserDir);
+    // 验证：成功从 -Duser.dir 提取出有效项目路径
+    assertNotNull(extracted2);
+    // 验证：提取的 user.dir 路径与预期一致
+    assertEquals(tempDir.toAbsolutePath().normalize(), extracted2);
+  }
+
+  /** 验证控制台停止接口禁止 GET 请求并返回 HTTP 405 Method Not Allowed。 */
+  @Test
+  void dashboard_server_stop_api_rejects_get_requests() throws Exception {
+    Path project = Files.createTempDirectory("dashboard-stop-sec-test");
+    int port = SimpleIde.findAvailablePort();
+    SimpleIde.DashboardServer server = SimpleIde.startDashboardServer(project, port);
+    try {
+      java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL("http://127.0.0.1:" + port + "/api/stop?configuration=App").openConnection();
+      conn.setRequestMethod("GET");
+      // 验证：GET 请求被安全拦截并返回 405
+      assertEquals(405, conn.getResponseCode());
+    } finally {
+      server.stop();
+    }
+  }
 }
+
+
 
 
 
