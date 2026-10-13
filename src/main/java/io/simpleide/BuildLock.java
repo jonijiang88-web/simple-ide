@@ -14,6 +14,7 @@ import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /** 本地构建排队锁，防止并发执行 build 耗尽系统资源。支持跨进程文件锁与同进程多线程排队。 */
@@ -81,6 +82,24 @@ public final class BuildLock implements Closeable {
 
   /** 阻塞排队获取指定路径的构建锁，若被占用则输出排队信息并在控制台等待。 */
   public static BuildLock acquire(Path project, Path lockFile) throws IOException {
+    return acquire(project, lockFile, 0, null);
+  }
+
+  /**
+   * 排队获取指定路径的构建锁，支持等待超时与调用方取消。
+   *
+   * <p>与构建子进程生命周期一致：等锁阶段可被超时/取消中断，避免调用方在锁空窗里无限挂起；
+   * 跨进程互斥语义（文件锁）与资源控制（JVM 锁）保持不变。
+   *
+   * @param project 目标项目
+   * @param lockFile 锁文件
+   * @param timeoutMillis 等待超时毫秒数；小于等于 0 表示不限时
+   * @param cancelToken 可选的取消令牌
+   * @return 已持有的构建锁
+   * @throws IOException 获取失败、超时或取消
+   */
+  public static BuildLock acquire(Path project, Path lockFile, long timeoutMillis,
+                                  io.simpleide.ProcessRunner.CancelToken cancelToken) throws IOException {
     Path normalizedPath = lockFile.toAbsolutePath().normalize();
     ensureParentDir(normalizedPath);
 
@@ -88,56 +107,79 @@ public final class BuildLock implements Closeable {
     if (jvmLock.isHeldByCurrentThread()) {
       throw new IllegalStateException("当前线程已持有该构建锁，不支持重入锁定");
     }
+    long deadline = timeoutMillis > 0 ? System.currentTimeMillis() + timeoutMillis : Long.MAX_VALUE;
 
     RandomAccessFile raf = null;
     FileChannel channel = null;
     FileLock fileLock = null;
-
     boolean queuedMessagePrinted = false;
 
-    // 先尝试非阻塞获取锁；如果失败则说明存在并发竞争，输出排队提示后阻塞等待
+    // 先尝试非阻塞获取；失败说明存在竞争，进入带超时/取消的排队流程
     if (jvmLock.tryLock()) {
-      boolean acquiredImmediately = false;
       try {
         raf = new RandomAccessFile(normalizedPath.toFile(), "rw");
         channel = raf.getChannel();
         fileLock = channel.tryLock();
         if (fileLock != null) {
-          acquiredImmediately = true;
+          writeHolderInfo(raf, project);
+          return new BuildLock(normalizedPath, jvmLock, raf, channel, fileLock);
         }
-      } catch (java.nio.channels.OverlappingFileLockException ignored) {
-      } catch (Exception ignored) {
       }
-
-      if (acquiredImmediately) {
-        writeHolderInfo(raf, project);
-        return new BuildLock(normalizedPath, jvmLock, raf, channel, fileLock);
+      catch (java.nio.channels.OverlappingFileLockException ignored) {
       }
-
-      // 未能立即拿到文件锁，释放资源准备进入阻塞排队流程
+      catch (Exception ignored) {
+      }
       closeSilently(fileLock, channel, raf);
+      fileLock = null;
+      channel = null;
+      raf = null;
       jvmLock.unlock();
     }
 
-    // 存在并发竞争，读取当前占用者信息并提示排队
+    // 排队等待：JVM 锁先在剩余时间内获取
     String holderInfo = readHolderInfo(normalizedPath);
     System.err.println("[simple-ide] 检测到已有 build 正在执行 (" + holderInfo + ")，正在排队等待获取本地构建锁...");
     queuedMessagePrinted = true;
 
-    // 阻塞获取进程内 JVM 锁
-    jvmLock.lock();
+    long remaining = remainingMillis(deadline);
+    try {
+      if (!jvmLock.tryLock(remaining, TimeUnit.MILLISECONDS)) {
+        throw new IOException("等待本地构建锁超时 (" + timeoutMillis + "ms)");
+      }
+    }
+    catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("等待本地构建锁被中断", e);
+    }
+
     try {
       raf = new RandomAccessFile(normalizedPath.toFile(), "rw");
       channel = raf.getChannel();
-      fileLock = channel.lock();
+      // 文件锁同样在剩余时间内轮询获取，保证跨进程等待也可超时/取消
+      while (true) {
+        if (cancelToken != null && cancelToken.isCancelled()) {
+          throw new IOException("等待本地构建锁被取消");
+        }
+        try {
+          fileLock = channel.tryLock();
+        }
+        catch (java.nio.channels.OverlappingFileLockException e) {
+          fileLock = null;
+        }
+        if (fileLock != null) break;
+        if (System.currentTimeMillis() >= deadline) {
+          throw new IOException("等待本地构建锁超时 (" + timeoutMillis + "ms)");
+        }
+        Thread.sleep(100);
+      }
 
       if (queuedMessagePrinted) {
         System.err.println("[simple-ide] 已获取本地构建锁，开始执行编译...");
       }
-
       writeHolderInfo(raf, project);
       return new BuildLock(normalizedPath, jvmLock, raf, channel, fileLock);
-    } catch (Throwable t) {
+    }
+    catch (Throwable t) {
       closeSilently(fileLock, channel, raf);
       if (jvmLock.isHeldByCurrentThread()) {
         jvmLock.unlock();
@@ -147,6 +189,13 @@ public final class BuildLock implements Closeable {
       }
       throw new IOException("获取构建本地锁失败", t);
     }
+  }
+
+  /** 计算距截止时间的剩余毫秒数；不限时时返回 Long.MAX_VALUE。 */
+  private static long remainingMillis(long deadline) {
+    if (deadline == Long.MAX_VALUE) return Long.MAX_VALUE;
+    long remaining = deadline - System.currentTimeMillis();
+    return remaining > 0 ? remaining : 0;
   }
 
   /** 非阻塞尝试获取指定路径构建锁，若已被占用则立即返回 null。 */

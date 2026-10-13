@@ -12,6 +12,8 @@ dependencies {
   implementation("org.junit.jupiter:junit-jupiter-engine:5.11.4")
   implementation("org.junit.vintage:junit-vintage-engine:5.11.4")
   testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+  // LocalTestRunner 需要同时验证 JUnit 4（经 Vintage 引擎）链路
+  testImplementation("junit:junit:4.13.2")
 }
 
 java {
@@ -49,6 +51,11 @@ distributions {
 tasks.test {
   useJUnitPlatform {
     excludeTags("fixture")
+  }
+  // io.simpleide.fixtures.* 是 LocalTestRunner 的受控夹具，由 LocalTestRunnerTest 主动执行，
+  // 不参与 Gradle 常规测试扫描（否则 @BeforeAll 失败的夹具会让整个构建失败）
+  filter {
+    excludeTestsMatching("io.simpleide.fixtures.*")
   }
   systemProperty("ij.mcp.server.port", "65431")
 }

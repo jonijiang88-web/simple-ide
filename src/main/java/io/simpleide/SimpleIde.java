@@ -43,6 +43,10 @@ public final class SimpleIde {
   static final int DEFAULT_MCP_PORT = 64342;
   /** 默认 JDWP 远程调试端口。 */
   static final int DEFAULT_DEBUG_PORT = 5005;
+  /** 工具版本，用于构建状态与缓存指纹追溯。 */
+  static final String TOOL_VERSION = "1.0.0";
+  /** 依赖 Classpath 缓存格式版本，与 jps-cli 保持一致。 */
+  static final String CACHE_FORMAT_VERSION = "2";
   /** 判定 npm 编译结果时最多从日志末尾读取的字节数。 */
   static final int LOG_TAIL_LIMIT_BYTES = 256 * 1024;
   /** 等待 IDEA 启动的最大秒数。 */
@@ -69,6 +73,10 @@ public final class SimpleIde {
         System.out.print(helpText(helpCommand));
         return;
       }
+      if (arguments.length > 0 && "--version".equals(arguments[0])) {
+        printVersion();
+        return;
+      }
       Command command = Command.parse(arguments);
       long startTime = System.currentTimeMillis();
       boolean success = true;
@@ -79,6 +87,8 @@ public final class SimpleIde {
         else if ("debug".equals(command.name)) { run(command); summary = "调试启动"; }
         else if ("test".equals(command.name)) { test(command); summary = "测试完成"; }
         else if ("status".equals(command.name)) { status(command); summary = "状态查询"; }
+        else if ("build-status".equals(command.name)) { buildStatus(command); summary = "构建状态查询"; }
+        else if ("version".equals(command.name)) { printVersion(); summary = "版本查询"; }
         else if ("logs".equals(command.name)) { logs(command); summary = "日志查询"; }
         else if ("stop".equals(command.name)) { stop(command); summary = "停止进程"; }
         else if ("list".equals(command.name)) { list(command); summary = "列出应用"; }
@@ -101,6 +111,14 @@ public final class SimpleIde {
       System.out.println(json(mapOf("success", false, "error", error.getMessage())));
       System.exit(1);
     }
+  }
+
+  /** 判断环境变量是否为真值（1/true/yes/on）。 */
+  static boolean truthyEnv(String name) {
+    String value = System.getenv(name);
+    if (value == null) return false;
+    String normalized = value.trim().toLowerCase();
+    return "1".equals(normalized) || "true".equals(normalized) || "yes".equals(normalized) || "on".equals(normalized);
   }
 
   /** 获取 MCP 端口，优先从系统属性或环境变量读取。 */
@@ -793,12 +811,28 @@ public final class SimpleIde {
   private static void build(Command command) throws Exception {
     Path project = command.project();
     boolean skipLock = command.flag("no-lock") || command.flag("skip-lock");
-    if (skipLock) {
-      executeBuild(command, project);
-      return;
+    List<String> modules = command.values("module");
+    int timeoutSec = Integer.parseInt(command.option("timeout", "1800"));
+    boolean explicitRebuild = command.flag("rebuild") || command.flag("clean");
+    boolean autoRebuild = command.flag("auto-rebuild");
+    long lockTimeoutMillis = Long.parseLong(command.option("lock-timeout", "0")) * 1000L;
+
+    // 跟踪器在等锁之前创建：这样 build-status 能看到真实排队阶段，而不是只有编译阶段
+    BuildTracker tracker = BuildTracker.start(project, command.option("engine", "jps"), modules, timeoutSec,
+      explicitRebuild || autoRebuild);
+    tracker.startHeartbeat(System.err);
+    try {
+      if (skipLock) {
+        executeBuild(command, project, tracker);
+        return;
+      }
+      tracker.phase(BuildTracker.PHASE_QUEUED);
+      try (BuildLock ignored = BuildLock.acquire(project, BuildLock.defaultLockFile(), lockTimeoutMillis, null)) {
+        executeBuild(command, project, tracker);
+      }
     }
-    try (BuildLock ignored = BuildLock.acquire(project)) {
-      executeBuild(command, project);
+    finally {
+      tracker.close();
     }
   }
 
@@ -828,19 +862,682 @@ public final class SimpleIde {
   }
 
   /**
+   * 查找项目依赖 Classpath 缓存文件（历史签名，取第一个命中项）。
+   *
+   * @param project 项目根目录
+   * @return 命中的缓存文件；未找到时返回 null
+   * @deprecated 多模块项目请使用 {@link #findClasspathCacheFile(Path, String)} 精确到模块
+   */
+  @Deprecated
+  static File findClasspathCacheFile(Path project) {
+    return findClasspathCacheFile(project, null);
+  }
+
+  /**
+   * 查找项目依赖 Classpath 缓存文件。
+   * 优先读取独立的 .jps-deps（jps-cli 当前默认位置），回退到历史位置的 .jps-cache。
+   * 之所以分离，是因为 JPS 检测到增量存储损坏时会递归删除整个 .jps-cache 目录。
+   *
+   * <p>多模块场景必须按模块名精确匹配，禁止「取第一个缓存」造成模块错配；
+   * 无法唯一定位时返回 null，由调用方显式报错。
+   *
+   * @param project 项目根目录
+   * @param moduleName 目标模块名；为 null 时仅在能唯一定位时返回
+   * @return 命中的缓存文件；未找到或多个候选时返回 null
+   */
+  static File findClasspathCacheFile(Path project, String moduleName) {
+    String[] candidateDirs = {".jps-deps", ".jps-cache"};
+    for (String dir : candidateDirs) {
+      File[] cacheFiles = project.resolve(dir).toFile()
+        .listFiles((d, name) -> name.startsWith("classpath-") && name.endsWith(".cache"));
+      if (cacheFiles == null || cacheFiles.length == 0) continue;
+      if (moduleName != null && !moduleName.trim().isEmpty()) {
+        String expected = "classpath-" + moduleName + ".cache";
+        for (File cacheFile : cacheFiles) {
+          if (cacheFile.getName().equals(expected)) return cacheFile;
+        }
+        continue;
+      }
+      // 未指定模块：仅当候选唯一时才返回，避免静默挑错模块
+      if (cacheFiles.length == 1) return cacheFiles[0];
+    }
+    return null;
+  }
+
+  /**
+   * 收集当前项目中仍在运行的 Application 配置名。
+   *
+   * @param project 项目根目录
+   * @return 存活的配置名列表
+   */
+  static List<String> runningConfigurations(Path project) {
+    List<String> running = new ArrayList<String>();
+    for (Map<String, Object> app : collectAssociatedApps(project)) {
+      if (Boolean.TRUE.equals(app.get("alive"))) {
+        running.add(String.valueOf(app.get("configuration")));
+      }
+    }
+    return running;
+  }
+
+  /** 上一次构建被强制终止（未完整完成）的标记文件路径。 */
+  static Path incompleteBuildMarker(Path project) {
+    return project.resolve(BuildTracker.BUILDS_DIR).resolve("incomplete.json");
+  }
+
+  /**
+   * 标记上一次构建未完整完成：下一次构建不能把这份不完整缓存/产物当成有效结果。
+   *
+   * @param project 项目根目录
+   * @param buildId 构建 ID
+   * @param errorCode 终止原因错误码
+   */
+  static void markIncompleteBuild(Path project, String buildId, String errorCode) {
+    markIncompleteBuildAt(incompleteBuildMarker(project), buildId, errorCode);
+  }
+
+  /**
+   * 在指定路径原子写入「未完整构建」标记。
+   *
+   * @param markerPath 标记文件路径
+   * @param buildId 构建 ID
+   * @param errorCode 原因码
+   */
+  static void markIncompleteBuildAt(Path markerPath, String buildId, String errorCode) {
+    if (markerPath == null) return;
+    try {
+      Map<String, Object> marker = new LinkedHashMap<String, Object>();
+      marker.put("buildId", buildId);
+      marker.put("errorCode", errorCode);
+      marker.put("timestamp", System.currentTimeMillis());
+      AtomicFiles.write(markerPath, json(marker));
+    }
+    catch (Exception ignored) {
+    }
+  }
+
+  /** 清除「构建未完整完成」标记（仅在构建成功后调用）。 */
+  static void clearIncompleteBuildMarker(Path project) {
+    try {
+      Files.deleteIfExists(incompleteBuildMarker(project));
+    }
+    catch (Exception ignored) {
+    }
+  }
+
+  /**
+   * 仅当标记属于本次构建时才清除，避免把更新的构建所写的标记误删。
+   *
+   * @param project 项目根目录
+   * @param buildId 本次构建 ID
+   */
+  static void clearIncompleteBuildMarkerIfOwned(Path project, String buildId) {
+    Path marker = incompleteBuildMarker(project);
+    if (buildId == null || buildId.isEmpty()) {
+      clearIncompleteBuildMarker(project);
+      return;
+    }
+    try {
+      String content = AtomicFiles.read(marker);
+      if (content == null) return;
+      Map<String, Object> parsed = JsonParser.tryParseObject(content);
+      Object owner = parsed == null ? null : parsed.get("buildId");
+      if (owner == null || buildId.equals(String.valueOf(owner))) {
+        Files.deleteIfExists(marker);
+      }
+    }
+    catch (Exception ignored) {
+    }
+  }
+
+  /**
    * 通过内置 JPS CLI 执行快速增量编译。
    *
+   * <p>可靠性约束：
+   * <ul>
+   *   <li>超时从进程启动时刻开始计时，输出并发消费，日志内存有上限；</li>
+   *   <li>超时/取消时回收整个子进程树并等待退出；</li>
+   *   <li>未正常完成时写入「未完整构建」标记，下一次构建会先做一次全量重建；</li>
+   *   <li>显式 rebuild 与 auto-rebuild 语义不同：显式 rebuild 直接清理重建（运行中的应用会阻止清理），
+   *       auto-rebuild 先增量，只有命中明确的缓存/历史 class 损坏特征才自动重建一次。</li>
+   * </ul>
+   *
    * @param project 目标项目根目录
+   * @param modules 目标模块（artifactId），可为空
+   * @param files 显式文件（JPS 不支持文件粒度，非空时显式拒绝）
    * @param timeoutSec 超时时间（秒）
-   * @param autoRebuild 是否强制全量清理并重编
+   * @param explicitRebuild 用户显式要求清理重建
+   * @param autoRebuild 允许在识别到缓存故障时自动重建一次
+   * @param tracker 可选的构建跟踪器
    * @return 构建状态；若 jps-cli 不可用或非 Maven 项目则返回 null
    */
-  private static BuildStatus buildViaJps(Path project, int timeoutSec, boolean autoRebuild) {
+  private static BuildStatus buildViaJps(Path project, List<String> modules, List<String> files, int timeoutSec,
+                                         boolean explicitRebuild, boolean autoRebuild, boolean forceIsolateCache,
+                                         boolean noIsolateCache, BuildTracker tracker, java.io.PrintStream jsonOut) {
     Path jpsJar = findJpsCliJar();
     if (jpsJar == null) return null;
     Path pomFile = project.resolve("pom.xml");
     if (!Files.isRegularFile(pomFile)) return null;
 
+    if (files != null && !files.isEmpty()) {
+      return failJps(project, tracker, jpsJar, timeoutSec, "UNSUPPORTED_FILE_SCOPE", null, null, false, null,
+        "JPS 引擎不支持按文件粒度的构建作用域（--file " + files + "）；请改用 --module <artifactId>，"
+          + "或使用 --engine idea-mcp。已拒绝执行以避免静默忽略作用域。", 0, null, jsonOut, null);
+    }
+
+    // 模块名必须真实存在；未知或歧义时显式报错，同时把 IntelliJ 模块名规范化为 artifactId
+    List<String> effectiveModules = new ArrayList<String>();
+    if (modules != null && !modules.isEmpty()) {
+      ModuleScope scope = resolveModuleScope(project, modules);
+      if (scope.error != null) {
+        return failJps(project, tracker, jpsJar, timeoutSec, "INVALID_MODULE_SCOPE", null, null, false, null,
+          scope.error, 0, null, jsonOut, null);
+      }
+      effectiveModules.addAll(scope.names);
+      if (tracker != null) tracker.put("modules", effectiveModules);
+    }
+
+    // 隔离报告：仅在受保护隔离构建时被赋值；上方早退路径引用它时为 null（不会写入隔离字段）
+    IsolationReport isolation = null;
+
+    // 1) 残留 JPS 构建检测：父命令被强杀后可能遗留仍在写缓存的 JPS
+    List<Long> orphans = detectOrphanJpsBuilds(project, jpsJar);
+    if (!orphans.isEmpty()) {
+      return failJps(project, tracker, jpsJar, timeoutSec, "ORPHAN_JPS_BUILD_DETECTED", null, null, false,
+        "orphan_jps_build_alive",
+        "检测到仍在运行的 JPS 构建进程 " + orphans + "（很可能是上一次命令被强制终止后遗留）；"
+          + "为避免与遗留进程并发写同一构建缓存，已拒绝本次构建。请确认并结束该进程后重试。", 0, null, jsonOut, isolation);
+    }
+
+    boolean clean = explicitRebuild;
+    String rebuildReason = explicitRebuild ? "explicit_rebuild" : null;
+
+    // 2) 未完整构建标记：上次构建未确认完成 → 需要一次全量重建（与其他 clean 入口共用同一保护）
+    if (!clean && Files.isRegularFile(incompleteBuildMarker(project))) {
+      clean = true;
+      rebuildReason = "previous_build_incomplete";
+      if (tracker != null) tracker.message("检测到上一次构建未完整完成，本次先执行一次全量重建");
+    }
+
+    // 3) 存储预检：JPS 内部会在存储打开失败时删除 dataStorageRoot 再全量重建，且无开关可关闭
+    JpsCacheValidator.Report cacheReport = JpsCacheValidator.validate(project);
+    if (cacheReport.corrupt) {
+      if (clean) {
+        if (tracker != null) tracker.message("已授权清理：忽略检测到的 JPS 存储损坏（" + cacheReport.describe() + "）");
+      }
+      else if (autoRebuild) {
+        clean = true;
+        rebuildReason = "jps_cache_corruption_detected";
+        if (tracker != null) {
+          tracker.message("检测到 JPS 增量存储损坏（" + cacheReport.describe() + "），本次按授权执行一次全量重建");
+        }
+      }
+      else {
+        return failJps(project, tracker, jpsJar, timeoutSec, "JPS_CACHE_CORRUPTED_REBUILD_REQUIRED", null,
+          runningConfigurations(project), true, "jps_cache_corruption_detected",
+          "检测到 JPS 增量存储损坏（" + cacheReport.describe() + "）。JPS 会以内置逻辑删除并重建该缓存，"
+            + "但本次未授权自动重建，已拒绝启动构建以避免未授权的破坏性恢复。"
+            + "请先停止运行中的应用并执行 simple-ide build --auto-rebuild（或 --rebuild）后重试。", 0, null, jsonOut, isolation);
+      }
+    }
+
+    // 4) 唯一清理闸门：所有 clean 入口都必须先确认无运行中应用
+    List<String> running = runningConfigurations(project);
+    if (clean && !running.isEmpty()) {
+      return failJps(project, tracker, jpsJar, timeoutSec, "REBUILD_BLOCKED_BY_RUNNING_APP", null, running, true, rebuildReason,
+        "存在运行中的 Application，禁止清理共享输出目录：" + running + "；请先 simple-ide stop 后再执行重建。", 0, null, jsonOut, isolation);
+    }
+
+    // 5) 受保护构建：只要存在运行中应用且未授权清理，默认把「增量缓存 + 编译输出」一起隔离。
+    //    隔离缓存：JPS 内部删除存储根目录时只影响副本；
+    //    隔离输出：JPS 内部恢复带来的全量重建只写入隔离输出根，绝不删改运行中应用实际使用的
+    //    target/classes、target/test-classes 与资源。
+    //    隔离构建不发布到共享 target（延后发布语义），调用方通过 JSON 的 outputsPublished/targetOutputsStale 获知。
+    boolean isolateBuild = shouldIsolateCache(clean, forceIsolateCache, noIsolateCache, running.size());
+    Path isolatedCacheDir = null;
+    Path isolatedOutputRoot = null;
+    if (isolateBuild) {
+      // 使用项目级稳定隔离目录：首次从共享缓存播种，之后复用，保证受保护构建仍然增量且不写共享状态
+      isolatedOutputRoot = isolatedBuildRoot(project).resolve("out");
+      try {
+        isolatedCacheDir = JpsCacheValidator.prepareIsolatedCache(project);
+      }
+      catch (IOException shadowFailure) {
+        return failJps(project, tracker, jpsJar, timeoutSec, "ISOLATED_BUILD_UNAVAILABLE", null, running, true,
+          "isolated_build_unavailable",
+          "存在运行中的 Application，但无法准备隔离缓存目录（" + shadowFailure.getMessage()
+            + "）。已拒绝在共享缓存/共享输出上执行构建，以免未授权的破坏性恢复影响运行中的应用。", 0, null, jsonOut, isolation);
+      }
+      System.err.println("[simple-ide] 受保护构建：隔离缓存 " + isolatedCacheDir + "，隔离编译输出 "
+        + isolatedOutputRoot + "（共享 .jps-cache 与 target 都不会被本进程改动）");
+      if (tracker != null) {
+        tracker.message("受保护构建：运行中应用存在且未授权清理，编译与缓存均在隔离目录进行，"
+          + "共享 target/.jps-cache 不被改动");
+        tracker.put("isolatedCache", isolatedCacheDir.toAbsolutePath().toString());
+        tracker.put("isolatedOutputRoot", isolatedOutputRoot.toAbsolutePath().toString());
+        tracker.put("isolatedBuild", true);
+      }
+    }
+
+    String buildId = tracker != null ? tracker.buildId() : BuildTracker.newBuildId();
+    // 6) 真正启动前可靠建立「未完整构建」标记（隔离构建只写隔离标记，不污染共享状态）
+    Path childMarker = isolateBuild
+      ? isolatedBuildRoot(project).resolve("incomplete.json")
+      : incompleteBuildMarker(project);
+    if (!isolateBuild) {
+      markIncompleteBuild(project, buildId, "in_progress");
+    }
+
+    // 7) 删除探针：放在实际被 JPS 使用的存储目录内，构建后检查是否被整体删除（不依赖 mtime/条目数）
+    Path storageDir = isolatedCacheDir != null ? isolatedCacheDir : JpsCacheValidator.projectCacheDir(project);
+    boolean probePlaced = !clean && JpsCacheValidator.placeDeletionProbe(storageDir);
+
+    ProcessRunner.Result first;
+    try {
+      first = runJpsProcess(project, jpsJar, effectiveModules, clean, timeoutSec, tracker, buildId, isolatedCacheDir,
+        isolatedOutputRoot, childMarker);
+    }
+    catch (RuntimeException unexpected) {
+      throw unexpected;
+    }
+    String firstOutput = first.stdout;
+    boolean storageDeleted = probePlaced && !JpsCacheValidator.probeSurvived(storageDir);
+    JpsCacheValidator.removeProbe(storageDir);
+    boolean internalRecovery = firstOutput.contains("[CACHE_REBUILT]")
+      || firstOutput.contains("Project rebuild forced")
+      || storageDeleted;
+
+    if (isolatedOutputRoot != null) {
+      isolation = new IsolationReport();
+      isolation.isolated = true;
+      isolation.cacheDir = isolatedCacheDir;
+      isolation.outputRoot = isolatedOutputRoot;
+      parseOutputMap(firstOutput, isolation.classes, isolation.testClasses);
+    }
+
+    if (!first.finished) {
+      String errorCode = first.cancelled ? "CANCELLED" : "TIMEOUT";
+      String message = first.cancelled
+        ? "JPS 构建被取消（已终止子进程树，killComplete=" + first.killComplete + "）"
+        : "JPS 编译超时 (" + timeoutSec + "s，已终止子进程树，killComplete=" + first.killComplete + ")";
+      if (!isolateBuild) markIncompleteBuild(project, buildId, errorCode);
+      if (!first.killComplete) {
+        errorCode = "PROCESS_TREE_NOT_TERMINATED";
+        message = message + "；未能确认整个子进程树已退出（存活 PID=" + first.survivingPids
+          + "），下一次构建前请确认没有遗留 JPS 进程。";
+      }
+      if (isolateBuild) {
+        message = message + "；本次为受保护隔离构建，共享 target 与 .jps-cache 未被改动。";
+      }
+      return failJps(project, tracker, jpsJar, timeoutSec, errorCode, firstOutput, null, false, rebuildReason, message,
+        first.durationMs, Integer.valueOf(first.exitCode), jsonOut, isolation);
+    }
+
+    if (first.exitCode == 0) {
+      if (!isolateBuild && internalRecovery && !clean) {
+        // 共享缓存被 JPS 内部未授权删除重建：构建产物正确，但不能静默当作普通成功。
+        // 缓存已完成一次完整重建并自洽，故清除标记（不额外强制下一次全量重建），但仍返回失败与证据。
+        if (!isolateBuild) clearIncompleteBuildMarkerIfOwned(project, buildId);
+        return failJps(project, tracker, jpsJar, timeoutSec, "JPS_INTERNAL_REBUILD_NOT_AUTHORIZED", firstOutput,
+          running, true, "jps_internal_rebuild_not_authorized",
+          "JPS 在未授权的情况下删除了共享增量缓存并执行了内部重建（删除探针已确认）。"
+            + "构建本身完成，但不能作为普通成功接受；如需受控重建请先停止运行中的应用并使用 --auto-rebuild/--rebuild。",
+          first.durationMs, Integer.valueOf(0), jsonOut, isolation);
+      }
+      if (!isolateBuild) clearIncompleteBuildMarkerIfOwned(project, buildId);
+      String reason;
+      if (isolateBuild && internalRecovery) reason = "isolated_build_cache_recovered";
+      else if (isolateBuild) reason = "isolated_build_no_publish";
+      else if (internalRecovery) reason = "jps_internal_cache_rebuild";
+      else reason = rebuildReason;
+      BuildStatus ok = okJps(project, tracker, jpsJar, firstOutput, first.durationMs, first.exitCode, clean,
+        reason, isolateBuild && internalRecovery, false, first.pid, timeoutSec, jsonOut, isolation);
+      return ok;
+    }
+
+    int exitCode = first.exitCode;
+    if (exitCode == 3 || firstOutput.contains("[CACHE_CORRUPT_REBUILD_REQUIRED]")) {
+      if (!isolateBuild) markIncompleteBuild(project, buildId, "cache_corruption_rebuild_required");
+      BuildStatus blocked = failJps(project, tracker, jpsJar, timeoutSec, "CACHE_CORRUPTED_REBUILD_REQUIRED", firstOutput,
+        running, true, "jps_cache_corruption_detected",
+        "JPS 检测到增量存储损坏；由于未授权清理，已按策略拒绝破坏性恢复，需要显式重建。",
+        first.durationMs, Integer.valueOf(exitCode), jsonOut, isolation);
+      return blocked;
+    }
+    if (exitCode == 4 || firstOutput.contains("[DEPENDENCY_RESOLUTION_FAILED]")) {
+      if (!isolateBuild) markIncompleteBuild(project, buildId, "dependency_resolution_failed");
+      BuildStatus failed = failJps(project, tracker, jpsJar, timeoutSec, "DEPENDENCY_RESOLUTION_FAILED", firstOutput, null, false,
+        "dependency_resolution_failed",
+        "依赖解析失败，已拒绝使用残缺依赖继续构建；证据见 .jps-deps/maven-resolve-*.log。",
+        first.durationMs, Integer.valueOf(exitCode), jsonOut, isolation);
+      return failed;
+    }
+    if (exitCode == 5 || firstOutput.contains("[BUILD_LOCKED]")) {
+      return failJps(project, tracker, jpsJar, timeoutSec, "BUILD_LOCKED_BY_ORPHAN", firstOutput, null, false,
+        "jps_build_lock_held",
+        "JPS 构建锁被其它构建（可能为遗留进程）持有，已拒绝并发写同一缓存。",
+        first.durationMs, Integer.valueOf(exitCode), jsonOut, isolation);
+    }
+
+    // 失败：只有「auto-rebuild + 明确的缓存损坏证据 + 不是真实源码错误」才额外重建一次，且仅一次
+    boolean realSourceError = JpsOutputParser.hasRealSourceError(firstOutput);
+    boolean cacheEvidence = JpsOutputParser.hasCacheCorruptionEvidence(firstOutput) || internalRecovery;
+    if (shouldAutoRebuild(autoRebuild, explicitRebuild, cacheEvidence, realSourceError)) {
+      List<String> runningNow = runningConfigurations(project);
+      if (!runningNow.isEmpty()) {
+        return failJps(project, tracker, jpsJar, timeoutSec, "REBUILD_BLOCKED_BY_RUNNING_APP", firstOutput, runningNow, true,
+          "cache_corruption_detected",
+          "识别到缓存/历史 class 损坏特征，但存在运行中的 Application，禁止清理共享输出目录：" + runningNow
+            + "；请先 simple-ide stop 后重新构建。", first.durationMs, Integer.valueOf(exitCode), jsonOut, isolation);
+      }
+      if (tracker != null) {
+        tracker.phase(BuildTracker.PHASE_REBUILD);
+        tracker.message("识别到缓存/历史 class 损坏特征，自动执行一次全量重建");
+      }
+      markIncompleteBuild(project, buildId, "auto_rebuild_in_progress");
+      ProcessRunner.Result second = runJpsProcess(project, jpsJar, effectiveModules, true, timeoutSec, tracker, buildId, null, null,
+        incompleteBuildMarker(project));
+      if (!second.finished) {
+        String errorCode = second.cancelled ? "CANCELLED" : "TIMEOUT";
+        markIncompleteBuild(project, buildId, errorCode);
+        return failJps(project, tracker, jpsJar, timeoutSec, errorCode, second.stdout, null, false, null,
+          "自动重建期间编译超时/取消 (" + timeoutSec + "s)", second.durationMs, Integer.valueOf(second.exitCode), jsonOut, isolation);
+      }
+      if (second.exitCode == 0) {
+        clearIncompleteBuildMarkerIfOwned(project, buildId);
+        return okJps(project, tracker, jpsJar, second.stdout, second.durationMs, second.exitCode, true,
+          "cache_corruption_detected", false, true, second.pid, timeoutSec, jsonOut, isolation);
+      }
+      markIncompleteBuild(project, buildId, "auto_rebuild_failed");
+      return failJps(project, tracker, jpsJar, timeoutSec, "BUILD_FAILED", second.stdout, null, false, null,
+        "自动重建后仍然编译失败", second.durationMs, Integer.valueOf(second.exitCode), jsonOut, isolation);
+    }
+
+    String errorCode = realSourceError ? "COMPILATION_ERROR" : (cacheEvidence ? "CACHE_SUSPECT_BUILD_FAILED" : "BUILD_FAILED");
+    String message = realSourceError
+      ? "编译失败：存在源码级错误"
+      : (cacheEvidence ? "编译失败且命中缓存可疑特征（未启用 --auto-rebuild，未自动重建）" : "JPS 编译失败，退出码: " + exitCode);
+    if (isolateBuild) {
+      message = message + "；本次为受保护隔离构建，共享 target 与 .jps-cache 未被改动。";
+    }
+    if (realSourceError && !isolateBuild) {
+      // 源码级编译错误属于「构建已完整跑完、仅源码有问题」：存储是自洽的，不应让下一次构建强制全量重建
+      clearIncompleteBuildMarkerIfOwned(project, buildId);
+    }
+    BuildStatus failed = failJps(project, tracker, jpsJar, timeoutSec, errorCode, firstOutput, null, false, null, message,
+      first.durationMs, Integer.valueOf(exitCode), jsonOut, isolation);
+    return failed;
+  }
+
+  /**
+   * 把受保护隔离构建信息并入测试结果 JSON（明确「测试跑在隔离输出上、共享 target 未更新」）。
+   *
+   * @param jsonText 测试结果 JSON
+   * @param preBuildStatus 前置构建状态
+   * @return 合并后的 JSON
+   */
+  static String iterateIsolationFields(String jsonText, BuildStatus preBuildStatus) {
+    if (preBuildStatus == null || !preBuildStatus.isolatedBuild) return jsonText;
+    Map<String, Object> extra = new LinkedHashMap<String, Object>();
+    extra.put("isolatedBuild", true);
+    extra.put("outputsPublished", false);
+    extra.put("targetOutputsStale", true);
+    extra.put("isolatedOutputs", describeIsolatedOutputs(preBuildStatus.isolatedClasses, preBuildStatus.isolatedTestClasses));
+    extra.put("notes", "测试使用受保护隔离构建的输出；共享 target/classes 与 target/test-classes 未被改动。");
+    return mergeJsonFields(jsonText, extra);
+  }
+
+  /**
+   * 构造构建状态并同步隔离信息（run/test 需要据此切换到隔离输出）。
+   *
+   * @param success 是否成功
+   * @param jsonResult 结果 JSON
+   * @param isolation 隔离信息；可为 null
+   * @return 构建状态
+   */
+  static BuildStatus newStatus(boolean success, String jsonResult, IsolationReport isolation) {
+    BuildStatus status = new BuildStatus(success, jsonResult);
+    if (isolation != null && isolation.isolated) {
+      status.isolatedBuild = true;
+      status.isolatedClasses = isolation.classes;
+      status.isolatedTestClasses = isolation.testClasses;
+    }
+    return status;
+  }
+
+  /** 受保护隔离构建报告信息。 */
+  static final class IsolationReport {
+    /** 是否启用隔离构建。 */
+    boolean isolated;
+    /** 隔离缓存目录。 */
+    Path cacheDir;
+    /** 隔离输出根目录。 */
+    Path outputRoot;
+    /** 模块 → 主输出目录。 */
+    Map<String, String> classes = new LinkedHashMap<String, String>();
+    /** 模块 → 测试输出目录。 */
+    Map<String, String> testClasses = new LinkedHashMap<String, String>();
+  }
+
+  /**
+   * 把隔离构建字段写入结果 JSON（在序列化之前调用，确保 stdout 可见）。
+   *
+   * @param result 结果 Map
+   * @param isolation 隔离信息；为 null 或未隔离时不写入
+   */
+  static void applyIsolationFields(Map<String, Object> result, IsolationReport isolation) {
+    if (result == null || isolation == null || !isolation.isolated) return;
+    result.put("isolatedBuild", true);
+    result.put("isolatedCache", isolation.cacheDir != null ? isolation.cacheDir.toAbsolutePath().toString() : null);
+    result.put("isolatedOutputRoot", isolation.outputRoot != null ? isolation.outputRoot.toAbsolutePath().toString() : null);
+    result.put("isolatedOutputs", describeIsolatedOutputs(isolation.classes, isolation.testClasses));
+    result.put("outputsPublished", false);
+    result.put("targetOutputsStale", true);
+    result.put("notes", "受保护隔离构建：编译输出与增量缓存均在隔离目录；共享 target/classes、target/test-classes "
+      + "与资源未被本进程删改。要更新共享输出，请先 simple-ide stop 停止应用后执行普通 build（或 --rebuild）。");
+  }
+
+  /** 隔离构建根目录（位于 .simple-ide 下，与共享 target/.jps-cache 完全分离）。 */
+  static Path isolatedBuildRoot(Path project) {
+    return project.resolve(".simple-ide/isolated-build");
+  }
+
+  /**
+   * 解析 jps-cli 输出的编译输出映射行。
+   *
+   * <p>格式：{@code [OUTPUT-MAP] <module>=<classes>|<testClasses>}。
+   *
+   * @param output 构建输出
+   * @param classes 输出参数：模块 → 主输出目录
+   * @param testClasses 输出参数：模块 → 测试输出目录
+   */
+  static void parseOutputMap(String output, Map<String, String> classes, Map<String, String> testClasses) {
+    if (output == null) return;
+    for (String rawLine : output.split("\n")) {
+      String line = rawLine.trim();
+      int marker = line.indexOf("[OUTPUT-MAP]");
+      if (marker < 0) continue;
+      String body = line.substring(marker + "[OUTPUT-MAP]".length()).trim();
+      int equals = body.indexOf('=');
+      if (equals <= 0) continue;
+      String module = body.substring(0, equals).trim();
+      String paths = body.substring(equals + 1).trim();
+      int pipe = paths.indexOf('|');
+      String classesPath = pipe >= 0 ? paths.substring(0, pipe).trim() : paths;
+      String testClassesPath = pipe >= 0 ? paths.substring(pipe + 1).trim() : null;
+      if (!module.isEmpty() && !classesPath.isEmpty()) classes.put(module, classesPath);
+      if (!module.isEmpty() && testClassesPath != null && !testClassesPath.isEmpty()) {
+        testClasses.put(module, testClassesPath);
+      }
+    }
+  }
+
+  /**
+   * 构造隔离输出的可读报告（模块 → {classes, testClasses}）。
+   *
+   * @param classes 模块 → 主输出目录
+   * @param testClasses 模块 → 测试输出目录
+   * @return JSON 可序列化的列表
+   */
+  static List<Map<String, Object>> describeIsolatedOutputs(Map<String, String> classes, Map<String, String> testClasses) {
+    List<Map<String, Object>> described = new ArrayList<Map<String, Object>>();
+    if (classes == null || classes.isEmpty()) return described;
+    for (Map.Entry<String, String> entry : classes.entrySet()) {
+      Map<String, Object> item = new LinkedHashMap<String, Object>();
+      item.put("module", entry.getKey());
+      item.put("classes", entry.getValue());
+      String testDir = testClasses == null ? null : testClasses.get(entry.getKey());
+      if (testDir != null) item.put("testClasses", testDir);
+      described.add(item);
+    }
+    return described;
+  }
+
+  /**
+   * 检测仍在运行的、针对同一项目的 JPS 构建进程（父命令被强杀后可能遗留）。
+   *
+   * <p>这些残留进程会继续写同一构建缓存，因此在启动新构建前必须阻断；
+   * 本方法只检测、不自动结束业务或用户进程。
+   *
+   * @param project 项目根目录
+   * @param jpsJar jps-cli jar 路径
+   * @return 残留 JPS 进程 PID 列表
+   */
+  static List<Long> detectOrphanJpsBuilds(Path project, Path jpsJar) {
+    List<Long> result = new ArrayList<Long>();
+    String needle = project.toAbsolutePath().normalize().toString();
+    String jarName = jpsJar != null ? jpsJar.getFileName().toString() : "jps-cli.jar";
+    long selfPid = ProcessTree.currentPid();
+    for (Long pid : ProcessTree.findByCommandLine(needle)) {
+      String cmdline = ProcessTree.commandLineOf(pid);
+      if (cmdline == null) continue;
+      if (!cmdline.contains(jarName)) continue;
+      if (pid == selfPid) continue;
+      if (!result.contains(pid)) result.add(pid);
+    }
+
+    // 次要信号：项目构建锁仍被持有，说明可能有 JPS 子进程在构建（父命令被强杀后仍可能存活）
+    try {
+      String content = AtomicFiles.read(project.resolve(".simple-ide/jps-build.lock"));
+      if (content != null) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("PID:\\s*(\\d+)").matcher(content);
+        if (matcher.find()) {
+          long lockPid = Long.parseLong(matcher.group(1));
+          if (lockPid > 0 && lockPid != selfPid && isProcessAlive(lockPid) && !result.contains(lockPid)) {
+            result.add(lockPid);
+          }
+        }
+      }
+    }
+    catch (Exception ignored) {
+    }
+    return result;
+  }
+
+  /**
+   * 决定是否使用隔离缓存目录执行本次构建。
+   *
+   * <p>规则：未授权清理（clean=false）且存在运行中应用时默认隔离；`--isolate-cache` 可强制隔离；
+   * `--no-isolate-cache` 可关闭该保护。隔离的意义是让 JPS 内部的「删除存储根目录再重建」
+   * 只作用于隔离副本，从而不依赖我们对损坏格式的识别能力。
+   *
+   * @param clean 本次是否为清理重建
+   * @param forceIsolate 是否显式强制隔离
+   * @param noIsolate 是否显式关闭隔离
+   * @param runningConfigurations 运行中应用数量
+   * @return 是否使用隔离缓存
+   */
+  static boolean shouldIsolateCache(boolean clean, boolean forceIsolate, boolean noIsolate, int runningConfigurations) {
+    if (noIsolate || clean) return false;
+    if (forceIsolate) return true;
+    return runningConfigurations > 0;
+  }
+
+  /**
+   * 决定是否触发受控自动重建。
+   *
+   * <p>auto-rebuild 与显式 rebuild 语义不同：它只在「非显式重建 + 命中明确缓存损坏特征 + 不是真实源码错误」
+   * 时才额外执行一次全量重建，绝不因为源码错误或 Lombok builder 缺失而重建。
+   *
+   * @param autoRebuild 是否启用 auto-rebuild
+   * @param explicitRebuild 是否为显式 rebuild
+   * @param cacheEvidence 是否命中缓存损坏特征
+   * @param realSourceError 是否存在真实源码级错误
+   * @return 是否应触发一次受控自动重建
+   */
+  static boolean shouldAutoRebuild(boolean autoRebuild, boolean explicitRebuild, boolean cacheEvidence,
+                                   boolean realSourceError) {
+    return autoRebuild && !explicitRebuild && cacheEvidence && !realSourceError;
+  }
+
+  /** 模块作用域解析结果。 */
+  static final class ModuleScope {
+    /** 规范化后的 Maven artifactId 列表。 */
+    final List<String> names = new ArrayList<String>();
+    /** 解析失败说明；成功时为 null。 */
+    String error;
+  }
+
+  /**
+   * 把请求的模块名（IntelliJ 模块名或 artifactId）规范化为唯一确定的 Maven artifactId。
+   *
+   * @param project 项目根目录
+   * @param requested 请求的模块名
+   * @return 作用域解析结果（失败时 error 非空）
+   */
+  static ModuleScope resolveModuleScope(Path project, List<String> requested) {
+    ModuleScope scope = new ModuleScope();
+    if (requested == null || requested.isEmpty()) return scope;
+    List<ModuleResolver.Module> resolved;
+    try {
+      resolved = ModuleResolver.resolve(project);
+    }
+    catch (IOException e) {
+      scope.error = "解析项目模块失败: " + e.getMessage();
+      return scope;
+    }
+    if (resolved.isEmpty()) {
+      scope.error = "未解析到任何 Maven 模块（缺少 pom.xml？）";
+      return scope;
+    }
+    List<String> available = new ArrayList<String>();
+    for (ModuleResolver.Module module : resolved) available.add(module.name);
+    if (available.isEmpty()) {
+      scope.error = "未解析到任何 Maven 模块（缺少 pom.xml？）";
+      return scope;
+    }
+    for (String name : requested) {
+      try {
+        scope.names.add(ModuleResolver.select(resolved, name).name);
+      }
+      catch (IOException e) {
+        scope.error = "--module " + name + " 无法唯一定位: " + e.getMessage();
+        return scope;
+      }
+    }
+    return scope;
+  }
+
+  /**
+   * 启动 JPS 子进程并实时消费输出。
+   *
+   * <p>生命周期硬化：进程创建后立即登记 PID（构建状态可在运行期间查到存活 PID）；注册取消令牌；
+   * 在子进程存续期间安装 JVM 关闭钩子，父 CLI 收到 TERM 时先取消并回收子进程树，
+   * 同时把「未完整构建」标记保留下来（只有构建成功才清除）。
+   *
+   * @param project 项目根目录
+   * @param jpsJar jps-cli jar 路径
+   * @param modules 目标模块
+   * @param clean 是否清理重建
+   * @param timeoutSec 超时秒数
+   * @param tracker 构建跟踪器（可为 null）
+   * @param buildId 本次构建 ID（用于标记所有权与状态登记）
+   * @return 进程执行结果
+   */
+  static ProcessRunner.Result runJpsProcess(Path project, Path jpsJar, List<String> modules, boolean clean,
+                                            int timeoutSec, final BuildTracker tracker, final String buildId,
+                                            Path isolatedCacheDir, Path isolatedOutputRoot, final Path markerPath) {
+    final Path buildLockFile = project.resolve(".simple-ide/jps-build.lock");
     List<String> processCommand = new ArrayList<String>();
     processCommand.add("java");
     processCommand.add("-Xms2g");
@@ -849,106 +1546,410 @@ public final class SimpleIde {
     processCommand.add("-jar");
     processCommand.add(jpsJar.toAbsolutePath().toString());
     processCommand.add(project.toAbsolutePath().toString());
-    if (autoRebuild) {
-      processCommand.add("--clean");
+    if (clean) processCommand.add("--clean");
+    if (isolatedCacheDir != null) {
+      processCommand.add("--cache-dir");
+      processCommand.add(isolatedCacheDir.toAbsolutePath().toString());
+    }
+    if (isolatedOutputRoot != null) {
+      // 关键：把 classes/test-classes 也隔离，JPS 内部恢复（删除存储后全量重建）不会触碰共享 target
+      processCommand.add("--output-root");
+      processCommand.add(isolatedOutputRoot.toAbsolutePath().toString());
+    }
+    if (modules != null) {
+      for (String module : modules) {
+        processCommand.add("--module");
+        processCommand.add(module);
+      }
+    }
+    // 未授权清理时禁止 JPS 内部执行破坏性恢复（删缓存重建），改为向上报告需要重建
+    processCommand.add("--on-corrupt-cache");
+    processCommand.add("fail");
+    // 子进程侧构建锁 + 未完整构建标记：用于父命令被强杀后的残留阻断与状态兜底
+    processCommand.add("--build-id");
+    processCommand.add(buildId != null ? buildId : "unknown");
+    processCommand.add("--lock-file");
+    processCommand.add(buildLockFile.toAbsolutePath().toString());
+    processCommand.add("--incomplete-marker");
+    processCommand.add(markerPath.toAbsolutePath().toString());
+
+    if (tracker != null) {
+      tracker.appendLog("$ " + String.join(" ", processCommand) + "\n");
+      tracker.phase(BuildTracker.PHASE_DEPENDENCY_RESOLVE);
     }
 
-    long start = System.currentTimeMillis();
-    try {
-      Process process = new ProcessBuilder(processCommand)
-        .directory(project.toFile())
-        .redirectErrorStream(true)
-        .start();
-
-      java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
-      byte[] data = new byte[4096];
-      int n;
-      while ((n = process.getInputStream().read(data, 0, data.length)) != -1) {
-        buffer.write(data, 0, n);
-        System.err.write(data, 0, n);
+    ProcessRunner.StreamListener listener = new ProcessRunner.StreamListener() {
+      @Override
+      public void onChunk(String stream, byte[] data, int length) {
+        String text = new String(data, 0, length, StandardCharsets.UTF_8);
+        // 构建输出走 stderr，保持 stdout 只有稳定机器可读 JSON
+        System.err.print(text);
         System.err.flush();
+        if (tracker != null) {
+          tracker.appendLog(text);
+          String phase = JpsOutputParser.inferPhase(text);
+          if (phase != null) tracker.phase(phase);
+        }
       }
-      boolean finished = process.waitFor(timeoutSec, java.util.concurrent.TimeUnit.SECONDS);
-      if (!finished) {
-        process.destroyForcibly();
-        Map<String, Object> err = new LinkedHashMap<String, Object>();
-        err.put("success", false);
-        err.put("engine", "jps");
-        err.put("error", "JPS 编译超时 (" + timeoutSec + "s)");
-        String errJson = json(err);
-        System.out.println(errJson);
-        return new BuildStatus(false, errJson);
-      }
+    };
 
-      int exitCode = process.exitValue();
-      String output = buffer.toString(StandardCharsets.UTF_8.name());
-      long duration = System.currentTimeMillis() - start;
-
-      int timeIdx = output.indexOf("耗时: ");
-      if (timeIdx > 0) {
-        int msIdx = output.indexOf(" ms", timeIdx);
-        if (msIdx > 0) {
+    final ProcessRunner.CancelToken cancelToken = new ProcessRunner.CancelToken();
+    final long[] childPid = new long[]{-1};
+    final Thread shutdownHook = new Thread(new Runnable() {
+      @Override
+      public void run() {
+        cancelToken.cancel();
+        if (childPid[0] > 0) {
+          ProcessTree.terminate(null, childPid[0], 2000, 5000);
+        }
+        if (markerPath != null) {
+          markIncompleteBuildAt(markerPath, buildId, "cli_terminated");
+        }
+        if (tracker != null) {
           try {
-            duration = Long.parseLong(output.substring(timeIdx + 4, msIdx).trim());
+            tracker.finish("CANCELLED", null, "CLI_TERMINATED");
           }
-          catch (Exception ignored) {}
-        }
-      }
-
-      List<Map<String, Object>> problems = new ArrayList<Map<String, Object>>();
-      if (exitCode != 0) {
-        for (String line : output.split("\n")) {
-          String trimmed = line.trim();
-          if (trimmed.startsWith("[ERROR]")) {
-            problems.add(mapOf("kind", "ERROR", "message", trimmed.substring(7).trim()));
+          catch (Throwable ignored) {
           }
         }
-        if (problems.isEmpty()) {
-          problems.add(mapOf("kind", "ERROR", "message", "JPS 编译失败，退出码: " + exitCode));
-        }
       }
-
-      boolean success = exitCode == 0;
-      Map<String, Object> resultMap = new LinkedHashMap<String, Object>();
-      resultMap.put("success", success);
-      resultMap.put("engine", "jps");
-      resultMap.put("durationMs", duration);
-      resultMap.put("problems", problems);
-      String resultJson = json(resultMap);
-      System.out.println(resultJson);
-      return new BuildStatus(success, resultJson);
+    }, "simple-ide-build-shutdown");
+    boolean hookRegistered = false;
+    try {
+      Runtime.getRuntime().addShutdownHook(shutdownHook);
+      hookRegistered = true;
     }
-    catch (Exception e) {
-      Map<String, Object> err = new LinkedHashMap<String, Object>();
-      err.put("success", false);
-      err.put("engine", "jps");
-      err.put("error", "JPS 进程启动异常: " + e.getMessage());
-      String errJson = json(err);
-      System.out.println(errJson);
-      return new BuildStatus(false, errJson);
+    catch (IllegalStateException ignored) {
+      // JVM 正在关闭，无法注册；此时不做额外承诺
+    }
+
+    ProcessRunner.StartListener startListener = new ProcessRunner.StartListener() {
+      @Override
+      public void onStarted(long pid) {
+        childPid[0] = pid;
+        if (tracker != null) {
+          tracker.pid(pid);
+          tracker.put("jpsPid", pid);
+          tracker.put("jpsStartedAtIso", new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS")
+            .format(new java.util.Date()));
+        }
+      }
+    };
+
+    try {
+      return ProcessRunner.run(processCommand, project, timeoutSec, true,
+        ProcessRunner.DEFAULT_MAX_OUTPUT_BYTES, listener, cancelToken, startListener);
+    }
+    finally {
+      if (hookRegistered) {
+        try {
+          Runtime.getRuntime().removeShutdownHook(shutdownHook);
+        }
+        catch (IllegalStateException ignored) {
+        }
+      }
+      if (tracker != null) tracker.put("jpsPid", childPid[0]);
     }
   }
 
+  /**
+   * 构造 JPS 构建成功结果 JSON。
+   *
+   * @param project 项目根目录
+   * @param tracker 构建跟踪器
+   * @param jpsJar jps-cli jar
+   * @param output 构建输出
+   * @param durationMs 耗时
+   * @param exitCode 退出码
+   * @param clean 是否为清理重建
+   * @param rebuildReason 重建原因
+   * @param cacheRebuilt JPS 是否内部重建过缓存
+   * @param autoRebuildPerformed 是否由 auto-rebuild 触发重建
+   * @param pid 子进程 PID
+   * @param timeoutSec 超时设置
+   * @return 构建状态
+   */
+  private static BuildStatus okJps(Path project, BuildTracker tracker, Path jpsJar, String output, long durationMs,
+                                   int exitCode, boolean clean, String rebuildReason, boolean cacheRebuilt,
+                                   boolean autoRebuildPerformed, long pid, int timeoutSec, java.io.PrintStream jsonOut,
+                                   IsolationReport isolation) {
+    long reported = JpsOutputParser.parseReportedDurationMs(output, durationMs);
+    List<Map<String, Object>> diagnostics = JpsOutputParser.parseDiagnostics(output);
+    Map<String, Object> result = new LinkedHashMap<String, Object>();
+    result.put("success", true);
+    result.put("engine", "jps");
+    result.put("phase", "COMPLETED");
+    result.put("exitCode", exitCode);
+    result.put("durationMs", reported);
+    result.put("diagnostics", diagnostics);
+    result.put("problems", toProblems(diagnostics));
+    attachBuildMetadata(result, project, tracker, jpsJar, timeoutSec, pid);
+    if (rebuildReason != null) result.put("rebuildReason", rebuildReason);
+    if (cacheRebuilt) result.put("cacheRebuilt", true);
+    if (autoRebuildPerformed) result.put("autoRebuildPerformed", true);
+    if (clean) result.put("rebuilt", true);
+    applyIsolationFields(result, isolation);
+    String resultJson = json(result);
+    if (jsonOut != null) jsonOut.println(resultJson);
+    if (tracker != null) tracker.finish("SUCCEEDED", Integer.valueOf(exitCode), null);
+    return newStatus(true, resultJson, isolation);
+  }
+
+  /**
+   * 构造 JPS 构建失败结果 JSON（统一错误码、阶段与结构化诊断）。
+   *
+   * @param project 项目根目录
+   * @param tracker 构建跟踪器
+   * @param jpsJar jps-cli jar
+   * @param timeoutSec 超时设置
+   * @param errorCode 统一错误码
+   * @param output 构建输出
+   * @param runningConfigurations 运行中的配置（阻止清理时使用）
+   * @param rebuildRequired 是否要求重建
+   * @param message 错误说明
+   * @param durationMs 耗时
+   * @param exitCode 退出码
+   * @return 构建状态
+   */
+  private static BuildStatus failJps(Path project, BuildTracker tracker, Path jpsJar, int timeoutSec, String errorCode,
+                                     String output, List<String> runningConfigurations, boolean rebuildRequired,
+                                     String rebuildReason, String message, long durationMs, Integer exitCode,
+                                     java.io.PrintStream jsonOut, IsolationReport isolation) {
+    List<Map<String, Object>> diagnostics = JpsOutputParser.parseDiagnostics(output);
+    Map<String, Object> result = new LinkedHashMap<String, Object>();
+    result.put("success", false);
+    result.put("engine", "jps");
+    result.put("phase", tracker != null ? tracker.snapshot().get("phase") : "COMPLETED");
+    result.put("errorCode", errorCode);
+    result.put("error", message);
+    if (exitCode != null) result.put("exitCode", exitCode.intValue());
+    result.put("durationMs", JpsOutputParser.parseReportedDurationMs(output, durationMs));
+    result.put("timedOut", "TIMEOUT".equals(errorCode));
+    result.put("cancelled", "CANCELLED".equals(errorCode));
+    result.put("diagnostics", diagnostics);
+    result.put("problems", toProblems(diagnostics));
+    if (rebuildRequired) {
+      result.put("rebuildRequired", true);
+      if (runningConfigurations != null) result.put("runningConfigurations", runningConfigurations);
+    }
+    if (rebuildReason != null) result.put("rebuildReason", rebuildReason);
+    attachBuildMetadata(result, project, tracker, jpsJar, timeoutSec, -1);
+    applyIsolationFields(result, isolation);
+    String resultJson = json(result);
+    if (jsonOut != null) jsonOut.println(resultJson);
+    if (tracker != null) tracker.finish("FAILED", exitCode, errorCode);
+    return newStatus(false, resultJson, isolation);
+  }
+
+  /** 注入构建可追溯元数据（构建 ID、PID、日志路径、工具与缓存版本）。 */
+  private static void attachBuildMetadata(Map<String, Object> result, Path project, BuildTracker tracker,
+                                          Path jpsJar, int timeoutSec, long pid) {
+    long effectivePid = pid;
+    if (tracker != null) {
+      result.put("buildId", tracker.buildId());
+      result.put("logFile", tracker.logFile().toAbsolutePath().toString());
+      result.put("startedAt", tracker.snapshot().get("startedAtIso"));
+      if (effectivePid <= 0) {
+        Object trackedPid = tracker.snapshot().get("pid");
+        if (trackedPid instanceof Number) effectivePid = ((Number) trackedPid).longValue();
+      }
+    }
+    result.put("pid", effectivePid);
+    result.put("timeoutSec", timeoutSec);
+    result.put("toolVersion", TOOL_VERSION);
+    result.put("cacheFormatVersion", CACHE_FORMAT_VERSION);
+    result.put("jpsCliJar", jpsJar != null ? jpsJar.toAbsolutePath().toString() : null);
+  }
+
+  /** 把结构化诊断转换为兼容旧字段的 problems 列表。 */
+  private static List<Map<String, Object>> toProblems(List<Map<String, Object>> diagnostics) {
+    List<Map<String, Object>> problems = new ArrayList<Map<String, Object>>();
+    for (Map<String, Object> diagnostic : diagnostics) {
+      Map<String, Object> problem = new LinkedHashMap<String, Object>();
+      problem.put("kind", diagnostic.get("severity"));
+      problem.put("message", diagnostic.get("message"));
+      if (diagnostic.containsKey("file")) problem.put("file", diagnostic.get("file"));
+      if (diagnostic.containsKey("line")) problem.put("line", diagnostic.get("line"));
+      if (diagnostic.containsKey("column")) problem.put("column", diagnostic.get("column"));
+      problems.add(problem);
+    }
+    return problems;
+  }
+
+  /**
+   * 解析项目 Classpath：按目标模块选择精确输出目录与依赖来源。
+   *
+   * @param project 项目根目录
+   * @param moduleHint 目标模块（IntelliJ 模块名或 artifactId）
+   * @param includeTestClasses 是否包含测试产物
+   * @return Classpath 计划（含告警）
+   * @throws IOException 模块歧义或无法解析
+   */
+  static ClasspathPlan resolveProjectClasspath(Path project, String moduleHint, boolean includeTestClasses) throws IOException {
+    return resolveProjectClasspath(project, moduleHint, includeTestClasses, null, null);
+  }
+
+  /**
+   * 解析项目 Classpath，可指定隔离输出目录覆盖（受保护隔离构建的产物不在共享 target 下）。
+   *
+   * @param project 项目根目录
+   * @param moduleHint 目标模块
+   * @param includeTestClasses 是否包含测试产物
+   * @param classesOverride 模块 → 主输出目录（隔离构建）；为 null 时使用共享 target
+   * @param testClassesOverride 模块 → 测试输出目录（隔离构建）；为 null 时使用共享 target
+   * @return Classpath 计划
+   * @throws IOException 模块歧义或无法解析
+   */
+  static ClasspathPlan resolveProjectClasspath(Path project, String moduleHint, boolean includeTestClasses,
+                                               Map<String, String> classesOverride,
+                                               Map<String, String> testClassesOverride) throws IOException {
+    if (classesOverride == null || classesOverride.isEmpty()) {
+      return resolveProjectClasspathFromSharedTarget(project, moduleHint, includeTestClasses);
+    }
+    ClasspathPlan plan = new ClasspathPlan();
+    List<ModuleResolver.Module> modules = ModuleResolver.resolve(project);
+    ModuleResolver.Module target = modules.isEmpty() ? null : ModuleResolver.select(modules, moduleHint);
+    plan.moduleName = target == null ? null : target.name;
+    List<ModuleResolver.Module> closure = target == null ? modules : ModuleResolver.closure(modules, target);
+    StringBuilder cp = new StringBuilder();
+    for (ModuleResolver.Module module : closure) {
+      if (includeTestClasses && testClassesOverride != null) {
+        String testDir = testClassesOverride.get(module.name);
+        if (testDir != null) cp.append(testDir).append(File.pathSeparator);
+      }
+      String classesDir = classesOverride.get(module.name);
+      if (classesDir != null) cp.append(classesDir).append(File.pathSeparator);
+    }
+    for (ModuleResolver.Module module : closure) {
+      File cacheFile = findClasspathCacheFile(project, module.name);
+      if (cacheFile == null && closure.size() == 1) cacheFile = findClasspathCacheFile(project);
+      if (cacheFile == null) {
+        plan.warnings.add("模块 " + module.name + " 未找到依赖 Classpath 缓存，可能缺少第三方依赖");
+        continue;
+      }
+      appendCacheEntries(project, cacheFile, cp, plan.warnings);
+    }
+    plan.classpath = cp.toString();
+    return plan;
+  }
+
+  /**
+   * 按共享 target 解析项目 Classpath。
+   *
+   * @param project 项目根目录
+   * @param moduleHint 目标模块
+   * @param includeTestClasses 是否包含测试产物
+   * @return Classpath 计划
+   * @throws IOException 模块歧义或无法解析
+   */
+  private static ClasspathPlan resolveProjectClasspathFromSharedTarget(Path project, String moduleHint,
+                                                                       boolean includeTestClasses) throws IOException {
+    ClasspathPlan plan = new ClasspathPlan();
+    List<ModuleResolver.Module> modules = ModuleResolver.resolve(project);
+
+    StringBuilder cp = new StringBuilder();
+    if (modules.isEmpty()) {
+      // 非 Maven 项目/无 pom：保留历史回退行为，但显式告警
+      cp.append(project.resolve("target/classes").toAbsolutePath()).append(File.pathSeparator);
+      if (includeTestClasses) {
+        cp.append(project.resolve("target/test-classes").toAbsolutePath()).append(File.pathSeparator);
+      }
+      File cacheFile = findClasspathCacheFile(project);
+      if (cacheFile != null) {
+        appendCacheEntries(project, cacheFile, cp, plan.warnings);
+      }
+      else {
+        plan.warnings.add("未找到依赖 Classpath 缓存，仅使用 target/classes");
+      }
+      plan.classpath = cp.toString();
+      return plan;
+    }
+
+    ModuleResolver.Module target = ModuleResolver.select(modules, moduleHint);
+    plan.moduleName = target.name;
+    List<ModuleResolver.Module> closure = ModuleResolver.closure(modules, target);
+    for (ModuleResolver.Module module : closure) {
+      if (includeTestClasses) {
+        cp.append(module.testOutputDir.toAbsolutePath()).append(File.pathSeparator);
+      }
+      cp.append(module.outputDir.toAbsolutePath()).append(File.pathSeparator);
+    }
+    for (ModuleResolver.Module module : closure) {
+      File cacheFile = findClasspathCacheFile(project, module.name);
+      if (cacheFile == null) {
+        // 单模块项目允许回退到唯一缓存；多模块缺失具体模块缓存时显式告警
+        if (closure.size() == 1) cacheFile = findClasspathCacheFile(project);
+        if (cacheFile == null) {
+          plan.warnings.add("模块 " + module.name + " 未找到依赖 Classpath 缓存，可能缺少第三方依赖");
+          continue;
+        }
+      }
+      appendCacheEntries(project, cacheFile, cp, plan.warnings);
+    }
+    plan.classpath = cp.toString();
+    return plan;
+  }
+
+  /** 追加缓存文件中的条目，并记录缺失 Jar 告警（不静默接受残缺缓存）。 */
+  private static void appendCacheEntries(Path project, File cacheFile, StringBuilder cp, List<String> warnings) {
+    List<String> missing = new ArrayList<String>();
+    try {
+      List<String> lines = Files.readAllLines(cacheFile.toPath(), StandardCharsets.UTF_8);
+      for (String line : lines) {
+        line = line.trim();
+        // 注释行（如「已确证无外部依赖」标记）不参与 Classpath 与缺失校验
+        if (line.isEmpty() || line.startsWith("#")) continue;
+        if (!Files.exists(Paths.get(line))) {
+          missing.add(line);
+          continue;
+        }
+        cp.append(line).append(File.pathSeparator);
+      }
+    }
+    catch (Exception e) {
+      warnings.add("读取依赖 Classpath 缓存失败: " + cacheFile + " (" + e.getMessage() + ")");
+    }
+    if (!missing.isEmpty()) {
+      // 缺失 Jar 不能静默接受：显式告警并提示重建，避免运行期 NoClassDefFoundError 被误当成代码问题
+      warnings.add("依赖 Classpath 缓存列出的 " + missing.size() + " 个 Jar 已不存在（缓存不完整），"
+        + "请重新执行 simple-ide build 生成完整缓存：" + cacheFile);
+    }
+  }
+
+  /** Classpath 解析结果。 */
+  static final class ClasspathPlan {
+    /** 完整 Classpath 字符串。 */
+    String classpath = "";
+    /** 命中的模块名；非 Maven 项目为 null。 */
+    String moduleName;
+    /** 告警信息。 */
+    final List<String> warnings = new ArrayList<String>();
+  }
+
   /** 执行实际编译逻辑：优先使用 JPS 增量编译引擎，支持降级到 IDEA MCP。 */
-  private static void executeBuild(Command command, Path project) throws Exception {
+  private static void executeBuild(Command command, Path project, BuildTracker tracker) throws Exception {
     List<String> modules = command.values("module");
     List<String> files = command.values("file");
     int timeoutSec = Integer.parseInt(command.option("timeout", "1800"));
-    boolean autoRebuild = command.flag("auto-rebuild") || command.flag("rebuild");
+    boolean explicitRebuild = command.flag("rebuild") || command.flag("clean");
+    boolean autoRebuild = command.flag("auto-rebuild");
+    boolean forceIsolateCache = command.flag("isolate-cache") || truthyEnv("SIMPLE_IDE_ISOLATE_CACHE");
+    boolean noIsolateCache = command.flag("no-isolate-cache") || truthyEnv("SIMPLE_IDE_NO_ISOLATE_CACHE");
     String requestedEngine = command.option("engine", "jps");
 
     BuildStatus status = null;
     if ("jps".equalsIgnoreCase(requestedEngine)) {
-      status = buildViaJps(project, timeoutSec, autoRebuild);
+      status = buildViaJps(project, modules, files, timeoutSec, explicitRebuild, autoRebuild, forceIsolateCache, noIsolateCache, tracker, System.out);
       if (status == null && command.option("engine", null) == null) {
-        status = buildViaMcp(project, modules, files, timeoutSec, autoRebuild);
+        status = buildViaMcp(project, modules, files, timeoutSec, explicitRebuild || autoRebuild);
       }
     }
     else {
-      status = buildViaMcp(project, modules, files, timeoutSec, autoRebuild);
+      status = buildViaMcp(project, modules, files, timeoutSec, explicitRebuild || autoRebuild);
     }
 
     if (status == null) {
+      tracker.finish("FAILED", null, "NO_ENGINE");
       throw new IllegalStateException("无可用的编译引擎（JPS 或 IDEA MCP 均未就绪）");
     }
     if (!status.success) {
@@ -968,54 +1969,81 @@ public final class SimpleIde {
       if (runViaMcp(project, configName, port, command)) return;
     }
 
-    // 前置步骤：增量编译校验（确保最新 class 产物）
+    // 先读取运行配置：模块名决定构建作用域与 Classpath 目标，避免多模块项目错配
+    ApplicationConfiguration configuration = ApplicationConfiguration.load(project, configName);
+    Path stateFile = runState(project, configuration.name);
+
+    // 启动前先检查同配置是否已在运行：避免隐式前置构建在旧实例仍在运行时清理/覆盖共享输出
+    RunState preExisting = RunState.read(stateFile);
+    if (preExisting != null && isProcessAlive(preExisting.pid)) {
+      throw new IllegalStateException("Application 已在运行，PID=" + preExisting.pid);
+    }
+    // 本项目已有其它运行中应用时，前置构建只能走隔离输出（不会发布），因此新进程会拿到陈旧 classpath；
+    // 这种情况在启动 JPS 之前就拒绝，避免「隔离成功被当成 target 已更新」。
+    List<String> runningBeforeRun = runningConfigurations(project);
+    if (!runningBeforeRun.isEmpty()) {
+      Map<String, Object> blocked = new LinkedHashMap<String, Object>();
+      blocked.put("success", false);
+      blocked.put("errorCode", "RUN_BLOCKED_BY_RUNNING_APP");
+      blocked.put("phase", "PRE_BUILD");
+      blocked.put("rebuildRequired", true);
+      blocked.put("runningConfigurations", runningBeforeRun);
+      blocked.put("rebuildReason", "outputs_not_publishable_while_app_running");
+      blocked.put("error", "本项目已有运行中的应用 " + runningBeforeRun
+        + "：受保护构建只写到隔离输出、不会发布到共享 target，直接启动会使用陈旧 classpath。"
+        + "请先 simple-ide stop 停止这些应用，再执行 run（或先执行普通 build 更新共享输出）。");
+      System.out.println(json(blocked));
+      System.exit(1);
+      return;
+    }
+
+    // 前置步骤：增量编译校验（确保最新 class 产物；按运行配置的模块精确限定作用域）
     if (!command.flag("skip-build")) {
       int timeoutSec = Integer.parseInt(command.option("timeout", "300"));
       boolean skipLock = command.flag("no-lock") || command.flag("skip-lock");
+      List<String> buildModules = new ArrayList<String>();
+      if (configuration.module != null && !configuration.module.trim().isEmpty()) {
+        buildModules.add(configuration.module);
+      }
       BuildStatus buildStatus;
       if (skipLock) {
-        buildStatus = buildViaJps(project, timeoutSec, false);
+        buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
       } else {
         try (BuildLock ignored = BuildLock.acquire(project)) {
-          buildStatus = buildViaJps(project, timeoutSec, false);
+          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
         }
       }
       if (buildStatus != null && !buildStatus.success) {
         System.err.println("[ERROR] 启动前置增量编译失败");
         System.exit(1);
       }
+      if (buildStatus != null && buildStatus.isolatedBuild) {
+        Map<String, Object> blocked = new LinkedHashMap<String, Object>();
+        blocked.put("success", false);
+        blocked.put("errorCode", "RUN_REQUIRES_PUBLISHED_OUTPUTS");
+        blocked.put("phase", "PRE_BUILD");
+        blocked.put("rebuildRequired", true);
+        blocked.put("rebuildReason", "isolated_build_not_published");
+        blocked.put("runningConfigurations", runningConfigurations(project));
+        blocked.put("error", "前置构建为受保护隔离构建（未发布到共享 target），直接启动会使用陈旧 classpath；"
+          + "请先停止运行中的应用再执行 run。");
+        System.out.println(json(blocked));
+        System.exit(1);
+        return;
+      }
     }
-
-    // 本地进程启动（读取 runConfiguration XML）
-    ApplicationConfiguration configuration = ApplicationConfiguration.load(project, configName);
-    Path stateFile = runState(project, configuration.name);
-    RunState current = RunState.read(stateFile);
-    if (current != null && isProcessAlive(current.pid)) throw new IllegalStateException("Application 已在运行，PID=" + current.pid);
 
     List<String> vmParams = split(configuration.vmParameters);
     int debugPort = resolveDebugPort(command, vmParams);
     Path runDirectory = project.resolve(".simple-ide/runs");
     Files.createDirectories(runDirectory);
 
-    // 注入 JPS 缓存生成的完整 Classpath
-    Path cacheDir = project.resolve(".jps-cache");
-    File[] cacheFiles = cacheDir.toFile().listFiles((d, name) -> name.startsWith("classpath-") && name.endsWith(".cache"));
-    String classpath = null;
-    if (cacheFiles != null && cacheFiles.length > 0) {
-      StringBuilder cpBuilder = new StringBuilder();
-      cpBuilder.append(project.resolve("target/classes").toAbsolutePath()).append(File.pathSeparator);
-      try {
-        List<String> lines = Files.readAllLines(cacheFiles[0].toPath(), StandardCharsets.UTF_8);
-        for (String line : lines) {
-          line = line.trim();
-          if (!line.isEmpty()) {
-            cpBuilder.append(line).append(File.pathSeparator);
-          }
-        }
-        classpath = cpBuilder.toString();
-      }
-      catch (Exception ignored) {}
+    // 按运行配置的模块解析精确 Classpath（模块输出目录 + 模块依赖缓存）；缓存缺 Jar 时显式告警
+    ClasspathPlan plan = resolveProjectClasspath(project, configuration.module, false);
+    for (String warning : plan.warnings) {
+      System.err.println("[WARN] " + warning);
     }
+    String classpath = plan.classpath;
 
     List<String> processCommand = buildJavaCommandLine(
         command.option("java", "java"),
@@ -1118,6 +2146,82 @@ public final class SimpleIde {
     System.out.println(json(result));
     if (Boolean.FALSE.equals(result.get("success"))) {
       System.exit(1);
+    }
+  }
+
+  /**
+   * 查询构建状态：返回真实阶段、PID、耗时、日志路径与失败/超时/取消状态，不伪造百分比或 ETA。
+   *
+   * @param command 命令参数
+   * @throws Exception 处理异常
+   */
+  private static void buildStatus(Command command) throws Exception {
+    Path project = command.optionalProject();
+    String buildId = command.option("build", "latest");
+    int tailLines = Integer.parseInt(command.option("tail", "0"));
+    Map<String, Object> state = BuildTracker.read(project, buildId);
+    if (state == null) {
+      Map<String, Object> err = new LinkedHashMap<String, Object>();
+      err.put("success", false);
+      err.put("errorCode", "BUILD_NOT_FOUND");
+      err.put("error", "未找到构建状态记录（build=" + buildId + "）");
+      err.put("projectPath", project.toString());
+      System.out.println(json(err));
+      System.exit(1);
+      return;
+    }
+    Map<String, Object> result = new LinkedHashMap<String, Object>(state);
+    result.put("success", true);
+    result.put("buildState", state.get("state"));
+    if (tailLines > 0) {
+      Object logFile = state.get("logFile");
+      if (logFile != null) {
+        try {
+          result.put("logTail", String.join("\n", tail(Paths.get(logFile.toString()), tailLines)));
+        }
+        catch (Exception ignored) {
+        }
+      }
+    }
+    System.out.println(json(result));
+  }
+
+  /** 打印工具、jps-cli 与缓存格式版本，便于安装版可追溯。 */
+  static void printVersion() {
+    Map<String, Object> result = new LinkedHashMap<String, Object>();
+    result.put("tool", "simple-ide");
+    result.put("version", TOOL_VERSION);
+    result.put("cacheFormatVersion", CACHE_FORMAT_VERSION);
+    result.put("javaVersion", System.getProperty("java.version"));
+    result.put("javaHome", System.getProperty("java.home"));
+    Path jpsJar = findJpsCliJar();
+    if (jpsJar != null) {
+      result.put("jpsCliJar", jpsJar.toAbsolutePath().toString());
+      result.put("jpsCliJarSize", jpsJar.toFile().length());
+      result.put("jpsCliJarSha256", sha256(jpsJar));
+    }
+    else {
+      result.put("jpsCliJar", null);
+    }
+    System.out.println(json(result));
+  }
+
+  /**
+   * 计算文件 SHA-256，用于验证分发构建与安装版本一致。
+   *
+   * @param file 文件路径
+   * @return 十六进制摘要；读取失败返回 null
+   */
+  static String sha256(Path file) {
+    try {
+      java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+      byte[] hash = digest.digest(Files.readAllBytes(file));
+      StringBuilder sb = new StringBuilder();
+      for (byte b : hash) sb.append(String.format("%02x", b));
+      return sb.toString();
+    }
+    catch (Exception e) {
+      return null;
     }
   }
 
@@ -1278,23 +2382,50 @@ public final class SimpleIde {
   /**
    * 通过内置 JPS 增量编译产物与本地 JUnit 平台执行测试。
    *
+   * <p>可靠性约束：按目标模块解析精确 Classpath；子进程有边界超时并回收进程树；
+   * 测试结果用真实 JSON 解析判定 success，不再用字符串 contains 猜测。
+   *
    * @param project 目标项目根目录
    * @param testClass 测试类全限定名
    * @param method 可选的测试方法名
+   * @param moduleHint 目标模块（可为 null，自动从测试源码路径推断）
    * @param timeoutSec 超时时间（秒）
    * @return 测试执行完成状态与结果
    */
-  private static TestStatus testViaJps(Path project, String testClass, String method, int timeoutSec) {
+  private static TestStatus testViaJps(Path project, String testClass, String method, String moduleHint, int timeoutSec,
+                                      BuildStatus preBuildStatus) {
     Path pomFile = project.resolve("pom.xml");
     if (!Files.isRegularFile(pomFile)) return new TestStatus(false, false, null);
 
-    Path cacheDir = project.resolve(".jps-cache");
-    File[] cacheFiles = cacheDir.toFile().listFiles((d, name) -> name.startsWith("classpath-") && name.endsWith(".cache"));
-    if (cacheFiles == null || cacheFiles.length == 0) return new TestStatus(false, false, null);
+    boolean isolatedBuild = preBuildStatus != null && preBuildStatus.isolatedBuild;
+    Map<String, String> isoClasses = isolatedBuild ? preBuildStatus.isolatedClasses : null;
+    Map<String, String> isoTestClasses = isolatedBuild ? preBuildStatus.isolatedTestClasses : null;
+    if (isolatedBuild) {
+      System.err.println("[simple-ide] 测试将使用受保护隔离构建的输出（共享 target 未被更新）");
+    }
 
     StringBuilder cpBuilder = new StringBuilder();
-    cpBuilder.append(project.resolve("target/test-classes").toAbsolutePath()).append(File.pathSeparator);
-    cpBuilder.append(project.resolve("target/classes").toAbsolutePath()).append(File.pathSeparator);
+    try {
+      ClasspathPlan plan = resolveProjectClasspath(project, moduleHint, true, isoClasses, isoTestClasses);
+      for (String warning : plan.warnings) {
+        System.err.println("[WARN] " + warning);
+      }
+      cpBuilder.append(plan.classpath);
+    }
+    catch (IOException e) {
+      Map<String, Object> errMap = new LinkedHashMap<String, Object>();
+      errMap.put("success", false);
+      errMap.put("testClass", testClass);
+      if (method != null) errMap.put("method", method);
+      errMap.put("exitCode", 1);
+      errMap.put("errorCode", "CLASSPATH_RESOLUTION_FAILED");
+      errMap.put("error", e.getMessage());
+      errMap.put("engine", "jps-local");
+      try { writeTestReport(project, testClass, errMap); } catch (Exception ignored) {}
+      String errJson = json(errMap);
+      System.out.println(errJson);
+      return new TestStatus(true, false, errJson);
+    }
 
     // 引入 simple-ide 运行时 lib（含 LocalTestRunner 与 JUnit Platform 引擎）
     try {
@@ -1314,20 +2445,6 @@ public final class SimpleIde {
     }
     catch (Exception ignored) {}
 
-    // 引入项目依赖 Jar 列表
-    try {
-      List<String> lines = Files.readAllLines(cacheFiles[0].toPath(), StandardCharsets.UTF_8);
-      for (String line : lines) {
-        line = line.trim();
-        if (!line.isEmpty()) {
-          cpBuilder.append(line).append(File.pathSeparator);
-        }
-      }
-    }
-    catch (Exception e) {
-      return new TestStatus(false, false, null);
-    }
-
     List<String> processCommand = new ArrayList<String>();
     processCommand.add("java");
     processCommand.add("-cp");
@@ -1338,90 +2455,152 @@ public final class SimpleIde {
       processCommand.add(method);
     }
 
+    ProcessRunner.Result result = ProcessRunner.run(processCommand, project, timeoutSec, false,
+      ProcessRunner.DEFAULT_MAX_OUTPUT_BYTES, null, null);
+
+    if (!result.started) {
+      return new TestStatus(false, false, null);
+    }
+    if (!result.finished) {
+      Map<String, Object> timeoutMap = new LinkedHashMap<String, Object>();
+      timeoutMap.put("success", false);
+      timeoutMap.put("testClass", testClass);
+      if (method != null) timeoutMap.put("method", method);
+      timeoutMap.put("exitCode", 1);
+      timeoutMap.put("errorCode", result.cancelled ? "CANCELLED" : "TIMEOUT");
+      timeoutMap.put("error", "测试执行超时/取消 (" + timeoutSec + "s，已终止子进程树，killComplete=" + result.killComplete + ")");
+      timeoutMap.put("engine", "jps-local");
+      try { writeTestReport(project, testClass, timeoutMap); } catch (Exception ignored) {}
+      String timeoutJson = json(timeoutMap);
+      System.out.println(timeoutJson);
+      return new TestStatus(true, false, timeoutJson);
+    }
+
+    // 真实 JSON 解析：从 stdout 中取最后一个可解析的 JSON 对象
+    String lastJsonLine = lastJsonObjectLine(result.stdout);
+    if (lastJsonLine != null) {
+      Map<String, Object> parsed = JsonParser.tryParseObject(lastJsonLine);
+      String merged = iterateIsolationFields(lastJsonLine, preBuildStatus);
+      String finalJson = attachReportFileAndWrite(project, testClass, merged);
+      System.out.println(finalJson);
+      boolean success = parsed != null && Boolean.TRUE.equals(parsed.get("success"));
+      return new TestStatus(true, success, finalJson);
+    }
+    else {
+      Map<String, Object> errMap = new LinkedHashMap<String, Object>();
+      errMap.put("success", false);
+      errMap.put("testClass", testClass);
+      if (method != null) errMap.put("method", method);
+      errMap.put("exitCode", result.exitCode);
+      errMap.put("errorCode", "NO_RESULT_JSON");
+      errMap.put("error", "未获取到测试结果 JSON: " + result.stdout);
+      errMap.put("engine", "jps-local");
+      try { writeTestReport(project, testClass, errMap); } catch (Exception ignored) {}
+      String errJson = json(errMap);
+      System.out.println(errJson);
+      return new TestStatus(true, false, errJson);
+    }
+  }
+
+  /**
+   * 把额外字段合并进一个 JSON 对象字符串（保持原字段不变）。
+   *
+   * @param jsonText 原 JSON 对象
+   * @param extra 额外字段
+   * @return 合并后的 JSON；无法解析时原样返回
+   */
+  static String mergeJsonFields(String jsonText, Map<String, Object> extra) {
+    if (jsonText == null || extra == null || extra.isEmpty()) return jsonText;
+    String trimmed = jsonText.trim();
+    if (!trimmed.startsWith("{")) return jsonText;
+    int lastBrace = trimmed.lastIndexOf('}');
+    if (lastBrace <= 0) return jsonText;
+    String body = trimmed.substring(1, lastBrace);
+    String extraBody = json(extra);
+    extraBody = extraBody.substring(1, extraBody.length() - 1);
+    if (body.trim().isEmpty()) return "{" + extraBody + "}";
+    return "{" + body + "," + extraBody + "}";
+  }
+
+  /**
+   * 从输出中取最后一个可被真实解析为 JSON 对象的行。
+   *
+   * @param stdout 子进程标准输出
+   * @return 可解析的 JSON 行；没有时返回 null
+   */
+  static String lastJsonObjectLine(String stdout) {
+    if (stdout == null || stdout.isEmpty()) return null;
+    String[] lines = stdout.split("\n");
+    for (int i = lines.length - 1; i >= 0; i--) {
+      String line = lines[i].trim();
+      if (!line.startsWith("{") || !line.endsWith("}")) continue;
+      if (JsonParser.tryParseObject(line) != null) return line;
+    }
+    return null;
+  }
+
+  /**
+   * 在项目根与各模块的 {@code src/test/java} 下定位测试源文件（多模块项目必需）。
+   *
+   * @param project 项目根目录
+   * @param testClass 测试类全限定名
+   * @param moduleHint 显式模块提示；命中时优先在该模块内查找
+   * @return 测试源文件路径；未找到时返回 null
+   */
+  static Path resolveTestSourceFile(Path project, String testClass, String moduleHint) {
+    if (testClass == null || testClass.trim().isEmpty()) return null;
+    String relative = testClass.trim().replace('.', '/') + ".java";
+    List<Path> candidates = new ArrayList<Path>();
     try {
-      Process process = new ProcessBuilder(processCommand)
-        .directory(project.toFile())
-        .redirectErrorStream(false)
-        .start();
-
-      java.io.ByteArrayOutputStream stdoutBuffer = new java.io.ByteArrayOutputStream();
-      java.io.ByteArrayOutputStream stderrBuffer = new java.io.ByteArrayOutputStream();
-
-      Thread outThread = new Thread(() -> {
+      List<ModuleResolver.Module> modules = ModuleResolver.resolve(project);
+      if (moduleHint != null && !moduleHint.trim().isEmpty()) {
         try {
-          byte[] buf = new byte[4096];
-          int r;
-          while ((r = process.getInputStream().read(buf)) != -1) {
-            stdoutBuffer.write(buf, 0, r);
-          }
+          ModuleResolver.Module hinted = ModuleResolver.select(modules, moduleHint);
+          if (hinted != null) candidates.add(hinted.testSourceDir.resolve(relative));
         }
-        catch (Exception ignored) {}
-      });
-      Thread errThread = new Thread(() -> {
-        try {
-          byte[] buf = new byte[4096];
-          int r;
-          while ((r = process.getErrorStream().read(buf)) != -1) {
-            stderrBuffer.write(buf, 0, r);
-            System.err.write(buf, 0, r);
-            System.err.flush();
-          }
-        }
-        catch (Exception ignored) {}
-      });
-      outThread.start();
-      errThread.start();
-
-      boolean finished = process.waitFor(timeoutSec, java.util.concurrent.TimeUnit.SECONDS);
-      if (!finished) {
-        process.destroyForcibly();
-        Map<String, Object> timeoutMap = new LinkedHashMap<String, Object>();
-        timeoutMap.put("success", false);
-        timeoutMap.put("testClass", testClass);
-        if (method != null) timeoutMap.put("method", method);
-        timeoutMap.put("exitCode", 1);
-        timeoutMap.put("error", "测试执行超时 (" + timeoutSec + "s)");
-        timeoutMap.put("engine", "jps-local");
-        try { writeTestReport(project, testClass, timeoutMap); } catch (Exception ignored) {}
-        String timeoutJson = json(timeoutMap);
-        System.out.println(timeoutJson);
-        return new TestStatus(true, false, timeoutJson);
-      }
-
-      outThread.join();
-      errThread.join();
-
-      String stdout = stdoutBuffer.toString(StandardCharsets.UTF_8.name());
-      String lastJsonLine = null;
-      for (String line : stdout.split("\n")) {
-        line = line.trim();
-        if (line.startsWith("{") && line.endsWith("}")) {
-          lastJsonLine = line;
+        catch (IOException ignored) {
         }
       }
-
-      if (lastJsonLine != null) {
-        String finalJson = attachReportFileAndWrite(project, testClass, lastJsonLine);
-        System.out.println(finalJson);
-        boolean success = finalJson.contains("\"success\":true") || finalJson.contains("\"success\": true");
-        return new TestStatus(true, success, finalJson);
-      }
-      else {
-        Map<String, Object> errMap = new LinkedHashMap<String, Object>();
-        errMap.put("success", false);
-        errMap.put("testClass", testClass);
-        if (method != null) errMap.put("method", method);
-        errMap.put("exitCode", process.exitValue());
-        errMap.put("error", "未获取到测试结果 JSON: " + stdout);
-        errMap.put("engine", "jps-local");
-        try { writeTestReport(project, testClass, errMap); } catch (Exception ignored) {}
-        String errJson = json(errMap);
-        System.out.println(errJson);
-        return new TestStatus(true, false, errJson);
+      for (ModuleResolver.Module module : modules) {
+        Path candidate = module.testSourceDir.resolve(relative);
+        if (!candidates.contains(candidate)) candidates.add(candidate);
       }
     }
-    catch (Exception e) {
-      return new TestStatus(false, false, null);
+    catch (IOException ignored) {
+    }
+    candidates.add(project.resolve("src/test/java").resolve(relative));
+    for (Path candidate : candidates) {
+      if (Files.isRegularFile(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * 从测试源码路径推断所在模块名（多模块项目用于精确限定测试编译与 Classpath 作用域）。
+   *
+   * @param project 项目根目录
+   * @param testFile 测试源文件路径
+   * @return 模块名；无法推断时返回 null
+   */
+  static String moduleOfTestSource(Path project, Path testFile) {
+    try {
+      List<ModuleResolver.Module> modules = ModuleResolver.resolve(project);
+      if (modules.isEmpty()) return null;
+      Path normalized = testFile.toAbsolutePath().normalize();
+      ModuleResolver.Module best = null;
+      int bestLength = -1;
+      for (ModuleResolver.Module module : modules) {
+        Path sourceRoot = module.testSourceDir.toAbsolutePath().normalize();
+        if (normalized.startsWith(sourceRoot) && sourceRoot.toString().length() > bestLength) {
+          best = module;
+          bestLength = sourceRoot.toString().length();
+        }
+      }
+      if (best != null) return best.name;
+      return modules.size() == 1 ? modules.get(0).name : null;
+    }
+    catch (IOException e) {
+      return null;
     }
   }
 
@@ -1432,23 +2611,34 @@ public final class SimpleIde {
     String method = command.option("method", null);
     String engine = command.option("engine", "jps");
 
-    // 将全限定类名转为文件路径
+    // 将全限定类名转为文件路径；多模块项目需在各模块的 src/test/java 下定位
     String filePath = "src/test/java/" + testClass.replace('.', '/') + ".java";
-    Path testFile = project.resolve(filePath);
-    if (!Files.isRegularFile(testFile)) throw new IOException("测试文件不存在：" + testFile);
+    Path testFile = resolveTestSourceFile(project, testClass, command.option("module", null));
+    if (testFile == null) {
+      throw new IOException("测试文件不存在：" + project.resolve(filePath) + "（已搜索项目根与各模块的 src/test/java）");
+    }
+    String relativeTestPath = toProjectRelative(project, testFile.toString());
 
     // 优先尝试基于 JPS 的本地测试引擎
+    BuildStatus preBuildStatus = null;
     if ("jps".equalsIgnoreCase(engine)) {
       int timeoutSec = Integer.parseInt(command.option("timeout", "300"));
+      String moduleHint = command.option("module", null);
+      if (moduleHint == null || moduleHint.trim().isEmpty()) {
+        // 未显式指定模块时，用目标测试文件所在模块（或唯一的 source root）作为作用域
+        moduleHint = moduleOfTestSource(project, testFile);
+      }
       if (!command.flag("skip-build")) {
         System.err.println("[INFO] 正在执行 JPS 前置编译校验...");
         boolean skipLock = command.flag("no-lock") || command.flag("skip-lock");
+        List<String> buildModules = new ArrayList<String>();
+        if (moduleHint != null && !moduleHint.trim().isEmpty()) buildModules.add(moduleHint);
         BuildStatus buildStatus;
         if (skipLock) {
-          buildStatus = buildViaJps(project, timeoutSec, false);
+          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
         } else {
           try (BuildLock ignored = BuildLock.acquire(project)) {
-            buildStatus = buildViaJps(project, timeoutSec, false);
+            buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
           }
         }
         if (buildStatus != null && !buildStatus.success) {
@@ -1458,9 +2648,10 @@ public final class SimpleIde {
           System.exit(1);
           return;
         }
+        preBuildStatus = buildStatus;
       }
 
-      TestStatus testStatus = testViaJps(project, testClass, method, timeoutSec);
+      TestStatus testStatus = testViaJps(project, testClass, method, moduleHint, timeoutSec, preBuildStatus);
       if (testStatus.executed) {
         if (!testStatus.success) {
           System.exit(1);
@@ -1502,12 +2693,12 @@ public final class SimpleIde {
     }
 
     // Step 1: 用 get_run_configurations(filePath=...) 获取 run points
-    int line = findTestLine(mcp, project, filePath, testClass, method);
+    int line = findTestLine(mcp, project, relativeTestPath, testClass, method);
 
     // Step 2: 用 execute_run_configuration(filePath + line) 执行
     Map<String, Object> args = new LinkedHashMap<String, Object>();
     args.put("projectPath", project.toString());
-    args.put("filePath", filePath);
+    args.put("filePath", relativeTestPath);
     args.put("line", line);
     args.put("waitForExit", true);
     args.put("timeout", 300000); // 5 分钟超时
@@ -3361,13 +4552,15 @@ public final class SimpleIde {
   /** 返回帮助文本。 */
   static String helpText(String command) {
     if (command == null || "help".equals(command) || "--help".equals(command) || "-h".equals(command))
-      return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
+      return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  build-status  查询最近一次构建的真实阶段/耗时/日志/失败原因\n  version 打印工具版本、jps-cli 摘要与缓存格式版本\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
     if ("list".equals(command)) return "用法: simple-ide list [--project <path>] [--running-only] [--clean] [--stop-all] [--table]\n\n列出 simple-ide 启动的所有应用并集中管控（支持跨项目汇总、展示 PID/端口/状态/日志；--running-only 仅看存活应用；--stop-all 一键集中停止所有应用；--clean 清理失效状态记录；--table 以表格格式输出）。\n";
-    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--clean] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。可选 --engine idea-mcp 回退到 IDEA MCP 编译。\n";
+    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n";
     if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build]\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port。\n";
     if ("debug".equals(command)) return "用法: simple-ide debug --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build]\n\n调试启动 Application（对齐 IDEA Debug 模式）。默认开启 JDWP 远程调试（默认端口 5005，可通过 --debug-port 自定义）。--random-port 自动选择空闲端口并传入 --server.port。\n";
-    if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>] [--engine <jps|idea-mcp>] [--skip-build]\n\n运行单元测试。默认通过内置 JPS 增量编译并在本地 JUnit 平台执行，秒级反馈，不依赖 IDEA 运行。\n";
+    if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>] [--module <artifactId>] [--engine <jps|idea-mcp>] [--skip-build] [--timeout <sec>]\n\n运行单元测试。默认通过内置 JPS 增量编译并在本地 JUnit 平台执行，秒级反馈，不依赖 IDEA 运行。\n未指定 --module 时按测试源码所在模块推断作用域；多模块且无法唯一确定时显式报错。\n结果 JSON 通过真实解析判定 success，并区分 failed/skipped/aborted/notExecuted/containersFailed。\n";
     if ("status".equals(command)) return "用法: simple-ide status --project <path> [--configuration <name>] [--engine <local|idea-mcp>]\n\n默认 --engine local 查询本地运行状态；--engine idea-mcp 查询已运行的 IDEA MCP 状态。\n";
+    if ("build-status".equals(command)) return "用法: simple-ide build-status [--project <path>] [--build <buildId|latest>] [--tail <lines>]\n\n查询构建真实状态：phase、state、pid、startedAt、durationMs、logFile、exitCode、errorCode。\n不提供百分比或 ETA；长构建期间进度与心跳输出在 stderr。\n";
+    if ("version".equals(command)) return "用法: simple-ide version\n\n打印工具版本、缓存格式版本与内置 jps-cli jar 的路径/大小/SHA-256，便于确认分发构建与安装版本一致。\n";
     if ("logs".equals(command)) return "用法: simple-ide logs --project <path> --configuration <name> [--tail <lines>]\n";
     if ("stop".equals(command)) return "用法: simple-ide stop --project <path> [--configuration <name>] [--engine <local|idea-mcp>]\n\n停止指定运行配置的应用进程。默认 --engine local 仅停止本地进程。\n";
     if ("report".equals(command)) return "用法: simple-ide report [--project <path>] [--port <number>] [--daemon] [--static] [--no-open]\n\n打开项目管理控制台（默认动态本地 HTTP 工作台，支持 3 秒实时轮询、实时日志流、一键停止应用；--static 导出静态单页 HTML；--daemon 让 HTTP 服务后台常驻）。\n";
@@ -3925,7 +5118,13 @@ public final class SimpleIde {
   /** 表示 IDEA 构建执行的成功状态与诊断结果。 */
   static final class BuildStatus {
     final boolean success;
-    final String jsonResult;
+    String jsonResult;
+    /** 是否为受保护隔离构建（编译输出未发布到共享 target）。 */
+    boolean isolatedBuild;
+    /** 隔离构建的主输出目录映射（模块名 → classes）。 */
+    Map<String, String> isolatedClasses;
+    /** 隔离构建的测试输出目录映射（模块名 → test-classes）。 */
+    Map<String, String> isolatedTestClasses;
 
     BuildStatus(boolean success, String jsonResult) {
       this.success = success;

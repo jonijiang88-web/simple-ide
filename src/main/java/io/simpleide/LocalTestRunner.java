@@ -113,7 +113,9 @@ public class LocalTestRunner {
                         record.message = t.getMessage() != null ? t.getMessage() : t.toString();
                     }
                 } else if (status == TestExecutionResult.Status.ABORTED) {
-                    record.status = "IGNORED";
+                    // aborted（如假设失败 AssumptionViolated）与 @Disabled 跳过语义不同，必须单独标记，
+                    // 否则无法区分「被跳过」与「被中止」，也无法准确统计真实执行数
+                    record.status = "ABORTED";
                     record.message = "Aborted";
                 }
                 finishedCases.add(record);
@@ -160,14 +162,19 @@ public class LocalTestRunner {
         long succeeded = summary.getTestsSucceededCount();
         long failed = summary.getTestsFailedCount();
         long skipped = summary.getTestsSkippedCount();
+        long aborted = summary.getTestsAbortedCount();
+        // 容器级失败（@BeforeAll/@AfterAll/类初始化抛异常）不会计入 testsFailed，
+        // 只凭 testsFailed==0 会把它误判为成功，因此必须显式统计
+        long containersFailed = summary.getContainersFailedCount();
 
-        // 收集全部失败用例详细信息
+        // 收集全部失败用例详细信息（含容器级失败）
         List<TestExecutionSummary.Failure> failures = summary.getFailures();
         List<Map<String, Object>> failureList = new ArrayList<Map<String, Object>>();
         for (TestExecutionSummary.Failure failure : failures) {
             Map<String, Object> failObj = new LinkedHashMap<String, Object>();
             TestIdentifier id = failure.getTestIdentifier();
             String name = resolveTestName(id);
+            boolean containerFailure = id != null && !id.isTest();
             Throwable t = failure.getException();
             String stackTrace = getStackTrace(t);
             String message = t != null ? (t.getMessage() != null ? t.getMessage() : t.toString()) : "";
@@ -175,6 +182,9 @@ public class LocalTestRunner {
             String location = extractFailureLocation(stackTrace, testClass);
 
             failObj.put("test", name);
+            if (containerFailure) {
+                failObj.put("container", true);
+            }
             failObj.put("exception", excType);
             if (message != null && !message.isEmpty()) {
                 failObj.put("message", message);
@@ -201,25 +211,49 @@ public class LocalTestRunner {
             testList.add(tcMap);
         }
 
-        boolean isSuccess = (failed == 0 && found > 0);
+        // 真实执行数：成功 + 失败 + aborted；@Disabled 跳过不计入执行数
+        long executed = succeeded + failed + aborted;
+        // 已发现但既未执行、也未显式跳过/中止（典型场景：容器初始化失败导致 @Test 根本没跑）
+        long notExecuted = Math.max(0, found - executed - skipped);
+        boolean noTestsFound = found == 0;
+        boolean hasFailures = failed > 0 || containersFailed > 0 || !failureList.isEmpty();
+        // 成功判定：无失败、确实发现测试，且至少有测试被执行或被显式跳过/中止。
+        // 合理跳过（@Disabled）不判失败；但容器初始化失败导致「发现测试却一个都没跑」必须判失败。
+        boolean isSuccess = !hasFailures && !noTestsFound && (executed > 0 || skipped > 0 || aborted > 0);
+
+        String errorCode = null;
+        if (noTestsFound) {
+            errorCode = "NO_TESTS_FOUND";
+        } else if (failed > 0) {
+            errorCode = "TEST_FAILED";
+        } else if (containersFailed > 0) {
+            errorCode = "CONTAINER_FAILED";
+        } else if (!isSuccess) {
+            errorCode = "TESTS_NOT_EXECUTED";
+        }
 
         // 构造控制台精炼输出
         StringBuilder outBuilder = new StringBuilder();
         if (isSuccess) {
             outBuilder.append("✓ All ").append(succeeded).append(" tests passed");
+            if (skipped > 0) outBuilder.append(" (").append(skipped).append(" skipped)");
+            if (aborted > 0) outBuilder.append(" (").append(aborted).append(" aborted)");
             if (duration > 0) outBuilder.append(" (").append(duration).append("ms)");
+        } else if (noTestsFound) {
+            outBuilder.append("✗ No tests found: ").append(testClass);
+            if (method != null) outBuilder.append("#").append(method);
+        } else if (containersFailed > 0 && failed == 0) {
+            outBuilder.append("✗ Test container failed (初始化/收尾失败): ").append(containersFailed)
+                .append(" container(s) failed, ").append(notExecuted).append(" test(s) executed=0");
+            if (duration > 0) outBuilder.append(" (").append(duration).append("ms)");
+            appendFailureDetails(outBuilder, failureList);
+        } else if (!isSuccess && failureList.isEmpty()) {
+            outBuilder.append("✗ Tests not executed: ").append(notExecuted)
+                .append("/").append(found).append(" test(s) did not run");
         } else {
             outBuilder.append("✗ Test Failed: ").append(failed).append("/").append(found).append(" tests failed");
             if (duration > 0) outBuilder.append(" (").append(duration).append("ms)");
-            for (Map<String, Object> failObj : failureList) {
-                outBuilder.append("\n\n--- Failure: ").append(failObj.get("test")).append(" ---");
-                if (failObj.containsKey("location")) outBuilder.append("\nLocation: ").append(failObj.get("location"));
-                if (failObj.containsKey("exception")) outBuilder.append("\nException: ").append(failObj.get("exception"));
-                if (failObj.containsKey("message")) outBuilder.append("\nMessage: ").append(failObj.get("message"));
-                if (failObj.containsKey("details")) {
-                    outBuilder.append("\nDetails:\n").append(failObj.get("details"));
-                }
-            }
+            appendFailureDetails(outBuilder, failureList);
         }
 
         Map<String, Object> result = new LinkedHashMap<String, Object>();
@@ -227,10 +261,17 @@ public class LocalTestRunner {
         result.put("testClass", testClass);
         if (method != null) result.put("method", method);
         result.put("exitCode", isSuccess ? 0 : 1);
+        result.put("phase", "test");
+        if (errorCode != null) result.put("errorCode", errorCode);
         result.put("total", found);
         result.put("passed", succeeded);
         result.put("failed", failed);
         result.put("ignored", skipped);
+        result.put("skipped", skipped);
+        result.put("aborted", aborted);
+        result.put("executed", executed);
+        result.put("notExecuted", notExecuted);
+        result.put("containersFailed", containersFailed);
         result.put("duration", duration);
 
         // 兼容旧字段
@@ -245,12 +286,35 @@ public class LocalTestRunner {
             // 兼容单个 failureMessage 字段
             result.put("failureMessage", failureList.get(0).get("message"));
         }
+        if (noTestsFound) {
+            result.put("error", "未发现可执行测试： " + testClass + (method != null ? "#" + method : ""));
+        }
         if (!testList.isEmpty()) {
             result.put("tests", testList);
         }
         result.put("output", outBuilder.toString());
         result.put("engine", "jps-local");
         return result;
+    }
+
+    /**
+     * 将失败明细（含源码定位、异常类型、消息与堆栈）追加到控制台输出文本。
+     *
+     * @param outBuilder 控制台输出构造器
+     * @param failureList 失败明细列表
+     */
+    static void appendFailureDetails(StringBuilder outBuilder, List<Map<String, Object>> failureList) {
+        for (Map<String, Object> failObj : failureList) {
+            outBuilder.append("\n\n--- Failure: ").append(failObj.get("test"));
+            if (Boolean.TRUE.equals(failObj.get("container"))) outBuilder.append(" [container]");
+            outBuilder.append(" ---");
+            if (failObj.containsKey("location")) outBuilder.append("\nLocation: ").append(failObj.get("location"));
+            if (failObj.containsKey("exception")) outBuilder.append("\nException: ").append(failObj.get("exception"));
+            if (failObj.containsKey("message")) outBuilder.append("\nMessage: ").append(failObj.get("message"));
+            if (failObj.containsKey("details")) {
+                outBuilder.append("\nDetails:\n").append(failObj.get("details"));
+            }
+        }
     }
 
     /**

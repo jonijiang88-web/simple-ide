@@ -27,10 +27,20 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 "$SIMPLE_IDE" test --engine jps --project "$PROJECT_DIR" --class <FQN> [--method <name>]
 ```
 
-- `build` 默认 JPS；未显式指定引擎且 JPS 不可用时，可能回退到 IDEA MCP。显式 `--engine jps` 避免该回退；检查退出码和 JSON 的 `success`、`engine`、`problems`。
-- JPS 生成 `target/classes`、`.jps-cache/` 和依赖 classpath 缓存；构建会同步项目资源。`--rebuild` / `--auto-rebuild` 请求清理重编；不要为普通增量构建默认启用。
-- `test` 默认本地 JPS/JUnit，显式 `--engine jps` 可避免回退。`--skip-build` 跳过前置增量编译直接复用已有测试产物。测试失败或前置编译失败时 CLI 进程返回非零退出码（1）；JSON 与控制台输出包含所有失败项（`failures` 包含测试方法、异常类型、提示、代码定位与完整堆栈）及持久化报告路径（`reportFile`，固定最新报告为 `.simple-ide/reports/test-report.json`）。
-- `--timeout` 单位为秒。编译或测试前遵循目标项目的授权与规则。编译过程实时向 stderr 输出进度日志，避免长时间无输出假死。
+- `build` 默认 JPS；未显式指定引擎且 JPS 不可用时，可能回退到 IDEA MCP。显式 `--engine jps` 避免该回退；检查退出码和 JSON 的 `success`、`engine`、`errorCode`、`phase`、`diagnostics`、`buildId`、`logFile`。
+- 失败诊断是结构化的：`diagnostics[]` 每项含 `severity`/`file`/`line`/`column`/`message`（旧字段 `problems` 保持兼容）；`stdout` 只输出稳定单行 JSON，编译进度与心跳走 `stderr`。
+- JPS 生成 `target/classes`、`.jps-cache/`（JPS 增量编译数据）与 `.jps-deps/classpath-<module>.cache`（依赖 Classpath 缓存，独立目录，避免被 JPS 在增量存储损坏时整体清理 `.jps-cache` 而误删）；构建会同步项目资源。
+- `--rebuild` 直接清理重建；`--auto-rebuild` 先增量，仅在命中缓存/历史 class 损坏特征时自动重建一次（真实源码错误与 Lombok `builder()` 缺失不触发）。不要为普通增量构建默认启用。存在运行中的 Application 时清理会被拒绝，返回 `rebuildRequired`/`rebuildReason`/`runningConfigurations`。
+- 超时从子进程启动时刻计时；超时/取消会先记录后代进程身份（PID+启动时间）再优雅终止，继而对忽略 TERM 的存活后代强杀并独立确认，根进程退出不算整棵树已退出。无法确认时返回 `PROCESS_TREE_NOT_TERMINATED` 并列出存活 PID（Java 8 用 `/proc`，Java 9+ 用 `ProcessHandle`，POSIX 回退 `ps`；无法枚举即视为未确认）。`--lock-timeout <sec>` 控制等锁超时。
+- 未完整构建标记在**启动前**写入、仅成功后清除；下一次构建据此先全量重建一次。
+- JPS 内部会在存储损坏时先删 `.jps-cache` 再重建且无开关可关。三层措施：①**删除探针**（存储目录内哨兵，消失才说明整根被删）避免正常首次/增量构建被误判；②可识别损坏在未授权时直接拒绝启动（`JPS_CACHE_CORRUPTED_REBUILD_REQUIRED`）；③**受保护隔离构建**——存在运行中应用且未授权清理时默认同时隔离「增量缓存 + 编译输出」（`.simple-ide/isolated-build/{cache,out/<module>/{classes,test-classes}}`），JPS 的删除重建既不碰共享 `.jps-cache` 也不碰运行中应用使用的 `target/*`（实测失败/成功/超时下共享 class 哈希与资源不变）。隔离结果**不发布**：JSON 返回 `isolatedBuild=true`/`isolatedOutputs`/`outputsPublished=false`/`targetOutputsStale=true`，要更新共享输出需先 `stop` 再普通 `build`；`run` 在项目已有应用运行时直接拒绝（`RUN_BLOCKED_BY_RUNNING_APP`），`test` 自动改用隔离输出。隔离缓存必须从空状态开始（复制共享存储会让 JPS 按记录删共享产物）。`--isolate-cache` 强制、`--no-isolate-cache` 关闭。共享路径上确认被删则返回 `JPS_INTERNAL_REBUILD_NOT_AUTHORIZED`。
+- 依赖解析失败不再继续用残缺依赖：缓存需通过指纹与「Jar 齐全」校验；**静态解析只有直接 Jar、无法证明传递闭包**，Maven 不可用时仅两种例外可继续：①零依赖且父 POM 无继承依赖；②全部依赖由 reactor 模块图提供（无 `dependencyManagement`/`profiles`/父级 `dependencies`）。其余一律 `DEPENDENCY_RESOLUTION_FAILED`（退出码 4）且不写有效缓存。
+- 父进程 `SIGTERM` 会经关闭钩子回收 JPS 子进程树并保留标记；父进程 `SIGKILL` 无法清理（平台限制），JPS 子进程持有 `.simple-ide/jps-build.lock`，下一次构建以 `ORPHAN_JPS_BUILD_DETECTED` 拒绝并发写缓存，需先结束残留进程。
+- `--module <artifactId>` 限定构建范围（含依赖闭包）；JPS 不支持 `--file` 粒度，传入会显式拒绝（`UNSUPPORTED_FILE_SCOPE`）。退出码：编译失败=1、缓存损坏需重建=3、依赖解析失败=4、构建锁被占用=5。
+- `test` 默认本地 JPS/JUnit，显式 `--engine jps` 可避免回退。`--skip-build` 跳过前置增量编译直接复用已有测试产物。测试失败、容器初始化失败（`CONTAINER_FAILED`）、未发现测试（`NO_TESTS_FOUND`）或前置编译失败时 CLI 进程返回非零退出码（1）；`success=false` 只由失败/未执行导致，合理跳过（`skipped`）不算失败。JSON 含 `failed`/`skipped`/`aborted`/`executed`/`notExecuted`/`containersFailed`、全部失败项（含容器级 `container:true`）与报告路径 `reportFile`（最新报告为 `.simple-ide/reports/test-report.json`）。
+- 多模块项目的 `run`/`test` 按 RunConfiguration 或测试源码所在模块选择输出目录与逐模块依赖缓存；无法唯一确定时显式报错，不静默取第一个缓存。
+- `--timeout` 单位为秒。编译或测试前遵循目标项目的授权与规则。编译过程实时向 stderr 输出进度与心跳，避免长时间无输出假死。
+- 查询构建状态与版本：`build-status [--build <id|latest>] [--tail <lines>]` 返回真实阶段/`pid`/`jpsPid`（运行期间即可查到存活构建进程）/`startedAt`/`durationMs`/`logFile`/`exitCode`/`errorCode`/`state`（不提供百分比或 ETA）；`version` 打印工具版本、缓存格式版本与 `jps-cli.jar` 的 SHA-256。
 
 ## Java 应用运行与调试
 
@@ -47,7 +57,7 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 - `run` 默认本地进程**纯运行模式**（不挂 JDWP 调试代理），类加载与 JIT C2 优化全开，获得对齐 IDEA Run 的极致启动速度；`--engine idea-mcp` 才请求 IDEA 托管。
 - `debug` 命令（或 `run --debug`）对齐 IDEA Debug 模式，自动开启 JDWP 远程调试（默认端口 `5005`，可通过 `--debug-port <port>` 自定义）；返回 JSON 与 `status` 中暴露 `debugPort` 字段，方便 VS Code 等客户端随时轻量 Attach 调试。
 - 本地运行读取 `.idea/runConfigurations/<name>.xml`，不存在时读取 `.idea/workspace.xml` 中同名 Application 配置。这里的 XML 是配置文件，不代表启动 IDEA。
-- 配置提供主类、模块、VM 参数、程序参数和工作目录；classpath 来自 `.jps-cache/classpath-*.cache`。
+- 配置提供主类、模块、VM 参数、程序参数和工作目录；classpath 按运行配置的模块解析（`target/classes`/`target/test-classes` 与 `.jps-deps/classpath-<module>.cache`，回退兼容旧位置 `.jps-cache/classpath-*.cache`）；缓存列出的 Jar 缺失时会显式告警，不静默使用残缺缓存。
 - 默认先执行 JPS 增量编译。`--skip-build` 跳过增量编译直接复用已有 class 与 classpath 缓存，毫秒级快速拉起。
 - `--port <n>` 固定端口；`--random-port` 选空闲端口并注入 `--server.port`；两者择一。
 - 返回 `STARTING` / `running:true` 只代表进程已创建，不证明应用就绪。返回的 `pid`、`port`、`debugPort`、`log` 用于后续检查。
@@ -65,7 +75,7 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 - `list` 集中管控所有由 simple-ide 启动的应用。不带 `--project` 时自动汇聚全局已知项目的所有服务，展示应用名、类型（java/npm）、PID、状态、端口、调试端口与日志；`--running-only` 仅看存活应用；`--clean` 清理失效状态记录；`--stop-all` 一键集中停止所有应用；`--table` 以整齐表格格式输出。
 - 当前版本 `status/stop` 默认 `local`；进程不存在时返回停止状态并清理过期状态，不回退 MCP。显式 `--engine idea-mcp` 只连接已运行的 MCP，不可用则报错。
 - `report` 生成并自动在浏览器中打开本地 HTML 运行仪表盘（`.simple-ide/reports/report.html`），展示关联应用（配置、PID、端口、调试端口、状态与日志）、最近测试执行结果与失败清单、以及命令历史记录。`--no-open` 仅生成文件而不主动打开浏览器。
-- 状态文件在 `.simple-ide/runs/`；Java 状态 `RUNNING` 仍需业务健康检查确认就绪。
+- 状态文件在 `.simple-ide/runs/`；构建状态与日志在 `.simple-ide/builds/`；Java 状态 `RUNNING` 仍需业务健康检查确认就绪。
 - 日志默认追加，避免把历史启动成功文案当成本轮结果；优先读取本轮尾部，不输出完整日志或完整 classpath 命令。
 
 ## npm 脚本管理

@@ -51,6 +51,122 @@ public final class SimpleIdeTest {
     assertEquals(Arrays.asList("second", "third"), SimpleIde.tail(file, 2));
   }
 
+  /** 验证依赖 Classpath 缓存优先取自独立的 .jps-deps，并回退历史目录 .jps-cache。 */
+  @Test
+  void resolves_classpath_cache_from_deps_before_legacy_cache() throws Exception {
+    Path project = Files.createTempDirectory("simple-ide-classpath");
+
+    // 验证：无任何缓存目录时返回 null，供启动流程据此给出显式告警。
+    assertNull(SimpleIde.findClasspathCacheFile(project));
+
+    Path legacyDir = Files.createDirectories(project.resolve(".jps-cache"));
+    Files.write(legacyDir.resolve("timestamp.cache"), "x\n".getBytes(StandardCharsets.UTF_8));
+    // 验证：非 classpath- 前缀的缓存文件不被误识别为依赖缓存。
+    assertNull(SimpleIde.findClasspathCacheFile(project));
+
+    Path legacyCache = Files.write(legacyDir.resolve("classpath-demo.cache"), "legacy\n".getBytes(StandardCharsets.UTF_8));
+    // 验证：仅存在历史目录缓存时回退命中该文件，保证旧项目仍可启动。
+    assertEquals(legacyCache.toFile(), SimpleIde.findClasspathCacheFile(project));
+
+    Path depsDir = Files.createDirectories(project.resolve(".jps-deps"));
+    Path depsCache = Files.write(depsDir.resolve("classpath-demo.cache"), "deps\n".getBytes(StandardCharsets.UTF_8));
+    // 验证：独立依赖缓存优先于历史位置，避免 JPS 清理 .jps-cache 时连带删除依赖缓存。
+    assertEquals(depsCache.toFile(), SimpleIde.findClasspathCacheFile(project));
+  }
+
+  /** 验证 auto-rebuild 与显式 rebuild 的语义差异，以及不会因真实源码错误触发重建。 */
+  @Test
+  void auto_rebuild_only_for_cache_corruption() {
+    // 验证：命中缓存损坏且非源码错误时触发一次自动重建
+    assertTrue(SimpleIde.shouldAutoRebuild(true, false, true, false));
+    // 验证：真实源码错误不触发重建（避免掩盖代码问题）
+    assertFalse(SimpleIde.shouldAutoRebuild(true, false, true, true));
+    // 验证：无缓存损坏证据不触发重建
+    assertFalse(SimpleIde.shouldAutoRebuild(true, false, false, false));
+    // 验证：未启用 auto-rebuild 时不重建
+    assertFalse(SimpleIde.shouldAutoRebuild(false, false, true, false));
+    // 验证：显式 rebuild 走独立路径，不再叠加 auto 重建
+    assertFalse(SimpleIde.shouldAutoRebuild(true, true, true, false));
+  }
+
+  /** 验证持久化的小工具版本与缓存格式版本可追溯。 */
+  @Test
+  void exposes_version_metadata() {
+    // 验证：工具版本非空
+    assertNotNull(SimpleIde.TOOL_VERSION);
+    // 验证：缓存格式版本与 jps-cli 约定一致为 2
+    assertEquals("2", SimpleIde.CACHE_FORMAT_VERSION);
+  }
+
+  /** 验证帮助信息包含新增的构建状态与自动重建说明。 */
+  @Test
+  void documents_build_scope_and_status() {
+    // 验证：构建帮助说明 --auto-rebuild 的受控语义
+    assertTrue(SimpleIde.helpText("build").contains("--auto-rebuild"));
+    // 验证：构建帮助说明 --rebuild 的运行中应用保护
+    assertTrue(SimpleIde.helpText("build").contains("运行中的 Application"));
+    // 验证：顶层帮助列出 build-status 命令
+    assertTrue(SimpleIde.helpText(null).contains("build-status"));
+    // 验证：顶层帮助列出 version 命令
+    assertTrue(SimpleIde.helpText(null).contains("version"));
+    // 验证：build-status 帮助说明不提供百分比或 ETA
+    assertTrue(SimpleIde.helpText("build-status").contains("不提供百分比"));
+  }
+
+  /** 验证测试源码可跨模块定位（多模块项目）。 */
+  @Test
+  void resolves_test_source_in_modules() throws Exception {
+    Path project = Files.createTempDirectory("simple-ide-testlocate");
+    Files.createDirectories(project.resolve("app/src/test/java/com/example"));
+    Files.write(project.resolve("pom.xml"),
+      ("<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  <artifactId>root</artifactId>\n"
+        + "  <packaging>pom</packaging><modules><module>app</module></modules>\n</project>\n").getBytes(StandardCharsets.UTF_8));
+    Files.write(project.resolve("app/pom.xml"),
+      ("<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  <artifactId>app</artifactId>\n</project>\n").getBytes(StandardCharsets.UTF_8));
+    Path testFile = project.resolve("app/src/test/java/com/example/AppTest.java");
+    Files.write(testFile, "package com.example;\npublic class AppTest {}\n".getBytes(StandardCharsets.UTF_8));
+
+    // 验证：能在子模块的 src/test/java 下定位测试源文件
+    assertEquals(testFile, SimpleIde.resolveTestSourceFile(project, "com.example.AppTest", null));
+    // 验证：定位不到的测试类返回 null
+    assertNull(SimpleIde.resolveTestSourceFile(project, "com.example.MissingTest", null));
+  }
+
+  /** 验证 lastJsonObjectLine 的兼容实现保持可用。 */
+  @Test
+  void selects_last_json_line() {
+    // 验证：取最后一个可解析 JSON 行
+    assertEquals("{\"success\":false}", SimpleIde.lastJsonObjectLine("log\n{\"success\":false}\n"));
+    // 验证：无 JSON 时返回 null
+    assertNull(SimpleIde.lastJsonObjectLine("no json"));
+  }
+
+  /** 【R3-3】验证隔离缓存判定：运行中应用+未授权清理默认隔离，可强制/关闭。 */
+  @Test
+  void isolates_cache_only_when_running_and_not_authorized() {
+    // 验证：存在运行中应用且未授权清理时默认隔离
+    assertTrue(SimpleIde.shouldIsolateCache(false, false, false, 1));
+    // 验证：没有运行中应用时不隔离（避免不必要的缓存复制开销）
+    assertFalse(SimpleIde.shouldIsolateCache(false, false, false, 0));
+    // 验证：显式 --isolate-cache 可强制隔离
+    assertTrue(SimpleIde.shouldIsolateCache(false, true, false, 0));
+    // 验证：--no-isolate-cache 可关闭保护
+    assertFalse(SimpleIde.shouldIsolateCache(false, false, true, 2));
+    // 验证：清理重建时不需要隔离（本来就要删缓存）
+    assertFalse(SimpleIde.shouldIsolateCache(true, true, false, 2));
+  }
+
+  /** 验证帮助信息说明隔离缓存与依赖失败退出码。 */
+  @Test
+  void documents_cache_isolation_and_exit_codes() {
+    // 验证：build 帮助说明 --isolate-cache
+    assertTrue(SimpleIde.helpText("build").contains("--isolate-cache"));
+    // 验证：build 帮助说明 --no-isolate-cache
+    assertTrue(SimpleIde.helpText("build").contains("--no-isolate-cache"));
+    // 验证：build 帮助说明依赖解析失败退出码
+    assertTrue(SimpleIde.helpText("build").contains("依赖解析失败=4"));
+  }
+
   /** 验证帮助信息包含运行时命令说明。 */
   @Test
   void describes_runtime_commands() {

@@ -14,8 +14,8 @@ public class MavenModuleInfo {
     private final File resourceDir;
     private final File testSourceDir;
     private final File testResourceDir;
-    private final File outputDir;
-    private final File testOutputDir;
+    private File outputDir;
+    private File testOutputDir;
     private final File generatedSourceDir;
     private final List<File> dependencyJars = new ArrayList<>();
     private final List<String> moduleDependencies = new ArrayList<>();
@@ -97,6 +97,24 @@ public class MavenModuleInfo {
      */
     public File getTestResourceDir() {
         return testResourceDir;
+    }
+
+    /**
+     * 重定向主编译输出目录（受保护构建用它把编译输出与共享 target 隔离）
+     *
+     * @param dir 新的主输出目录
+     */
+    public void setOutputDir(File dir) {
+        this.outputDir = dir;
+    }
+
+    /**
+     * 重定向测试编译输出目录（受保护构建用它把编译输出与共享 target 隔离）
+     *
+     * @param dir 新的测试输出目录
+     */
+    public void setTestOutputDir(File dir) {
+        this.testOutputDir = dir;
     }
 
     /**

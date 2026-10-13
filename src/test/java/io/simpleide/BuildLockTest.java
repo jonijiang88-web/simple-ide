@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** 验证 BuildLock 本地排队锁的行为与生命周期。 */
@@ -156,5 +157,82 @@ public final class BuildLockTest {
     assertTrue(lockFile.getFileName().toString().equals("build.lock"));
     // 验证：默认锁文件为绝对路径
     assertTrue(lockFile.isAbsolute());
+  }
+
+  /** 验证等待锁支持超时，避免调用方在锁空窗里无限挂起。 */
+  @Test
+  void wait_for_lock_times_out(@TempDir Path tempDir) throws Exception {
+    Path lockFile = tempDir.resolve("build.lock");
+    Path project = tempDir.resolve("mock-project");
+
+    CountDownLatch holderAcquired = new CountDownLatch(1);
+    CountDownLatch releaseHolder = new CountDownLatch(1);
+    Thread holder = new Thread(() -> {
+      try (BuildLock lock = BuildLock.acquire(project, lockFile)) {
+        holderAcquired.countDown();
+        releaseHolder.await(10, TimeUnit.SECONDS);
+      }
+      catch (Exception ignored) {
+      }
+    });
+    holder.start();
+    // 验证：占用者已拿到锁
+    assertTrue(holderAcquired.await(5, TimeUnit.SECONDS));
+
+    long start = System.currentTimeMillis();
+    IOException error = assertThrows(IOException.class,
+      () -> BuildLock.acquire(project, lockFile, 500, null));
+    long elapsed = System.currentTimeMillis() - start;
+
+    // 验证：超时后抛出明确异常而不是永久阻塞
+    assertTrue(error.getMessage().contains("超时"));
+    // 验证：超时时间被真实遵守（远小于 10 秒）
+    assertTrue(elapsed < 8000, "等锁超时应及时生效，实际 " + elapsed + "ms");
+
+    releaseHolder.countDown();
+    holder.join(5000);
+    // 验证：释放后可再次成功获取
+    try (BuildLock reacquired = BuildLock.tryAcquire(project, lockFile)) {
+      assertNotNull(reacquired);
+    }
+  }
+
+  /** 验证等待锁可被取消令牌中断。 */
+  @Test
+  void wait_for_lock_can_be_cancelled(@TempDir Path tempDir) throws Exception {
+    Path lockFile = tempDir.resolve("build.lock");
+    Path project = tempDir.resolve("mock-project");
+
+    CountDownLatch holderAcquired = new CountDownLatch(1);
+    CountDownLatch releaseHolder = new CountDownLatch(1);
+    Thread holder = new Thread(() -> {
+      try (BuildLock lock = BuildLock.acquire(project, lockFile)) {
+        holderAcquired.countDown();
+        releaseHolder.await(10, TimeUnit.SECONDS);
+      }
+      catch (Exception ignored) {
+      }
+    });
+    holder.start();
+    assertTrue(holderAcquired.await(5, TimeUnit.SECONDS));
+
+    ProcessRunner.CancelToken token = new ProcessRunner.CancelToken();
+    Thread canceller = new Thread(() -> {
+      try {
+        Thread.sleep(300);
+      }
+      catch (InterruptedException ignored) {
+      }
+      token.cancel();
+    });
+    canceller.start();
+
+    IOException error = assertThrows(IOException.class,
+      () -> BuildLock.acquire(project, lockFile, 0, token));
+    // 验证：取消后抛出明确异常
+    assertTrue(error.getMessage().contains("取消"));
+
+    releaseHolder.countDown();
+    holder.join(5000);
   }
 }
