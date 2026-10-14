@@ -1013,7 +1013,8 @@ public final class SimpleIde {
    */
   private static BuildStatus buildViaJps(Path project, List<String> modules, List<String> files, int timeoutSec,
                                          boolean explicitRebuild, boolean autoRebuild, boolean forceIsolateCache,
-                                         boolean noIsolateCache, BuildTracker tracker, java.io.PrintStream jsonOut) {
+                                         boolean noIsolateCache, boolean autoRestartEnabled, BuildTracker tracker,
+                                         java.io.PrintStream jsonOut) {
     Path jpsJar = findJpsCliJar();
     if (jpsJar == null) return null;
     Path pomFile = project.resolve("pom.xml");
@@ -1083,6 +1084,12 @@ public final class SimpleIde {
 
     // 4) 唯一清理闸门：所有 clean 入口都必须先确认无运行中应用
     List<String> running = runningConfigurations(project);
+    // 4') 运行中应用 + 待编译源文件：默认停止应用 → 用共享输出编译 → 成功后按原参数重启；
+    //     否则「受保护构建」只把改动写进隔离目录，运行时仍是旧 class（--no-auto-restart 关闭该行为）。
+    List<Map<String, Object>> restartPlan = prepareAutoRestart(project, tracker, autoRestartEnabled);
+    if (!restartPlan.isEmpty()) {
+      running = new ArrayList<String>();
+    }
     if (clean && !running.isEmpty()) {
       return failJps(project, tracker, jpsJar, timeoutSec, "REBUILD_BLOCKED_BY_RUNNING_APP", null, running, true, rebuildReason,
         "存在运行中的 Application，禁止清理共享输出目录：" + running + "；请先 simple-ide stop 后再执行重建。", 0, null, jsonOut, isolation);
@@ -1190,6 +1197,11 @@ public final class SimpleIde {
       else if (isolateBuild) reason = "isolated_build_no_publish";
       else if (internalRecovery) reason = "jps_internal_cache_rebuild";
       else reason = rebuildReason;
+      if (!restartPlan.isEmpty()) {
+        List<Map<String, Object>> restarted = restartApplications(project, restartPlan);
+        if (tracker != null) tracker.put("restartedApplications", restarted);
+        System.err.println("[simple-ide] 已按原参数重启应用：" + restarted);
+      }
       BuildStatus ok = okJps(project, tracker, jpsJar, firstOutput, first.durationMs, first.exitCode, clean,
         reason, isolateBuild && internalRecovery, false, first.pid, timeoutSec, jsonOut, isolation);
       return ok;
@@ -1675,6 +1687,8 @@ public final class SimpleIde {
                                    IsolationReport isolation) {
     long reported = JpsOutputParser.parseReportedDurationMs(output, durationMs);
     List<Map<String, Object>> diagnostics = JpsOutputParser.parseDiagnostics(output);
+    Map<String, Object> diagnosticsSummary = new LinkedHashMap<String, Object>();
+    diagnostics = dedupeDiagnostics(diagnostics, diagnosticsSummary);
     Map<String, Object> result = new LinkedHashMap<String, Object>();
     result.put("success", true);
     result.put("engine", "jps");
@@ -1683,12 +1697,14 @@ public final class SimpleIde {
     result.put("durationMs", reported);
     result.put("diagnostics", diagnostics);
     result.put("problems", toProblems(diagnostics));
+    result.putAll(diagnosticsSummary);
     attachBuildMetadata(result, project, tracker, jpsJar, timeoutSec, pid);
     if (rebuildReason != null) result.put("rebuildReason", rebuildReason);
     if (cacheRebuilt) result.put("cacheRebuilt", true);
     if (autoRebuildPerformed) result.put("autoRebuildPerformed", true);
     if (clean) result.put("rebuilt", true);
     applyIsolationFields(result, isolation);
+    attachAutoRestartFields(result, tracker);
     String resultJson = json(result);
     if (jsonOut != null) jsonOut.println(resultJson);
     if (tracker != null) tracker.finish("SUCCEEDED", Integer.valueOf(exitCode), null);
@@ -1716,6 +1732,8 @@ public final class SimpleIde {
                                      String rebuildReason, String message, long durationMs, Integer exitCode,
                                      java.io.PrintStream jsonOut, IsolationReport isolation) {
     List<Map<String, Object>> diagnostics = JpsOutputParser.parseDiagnostics(output);
+    Map<String, Object> diagnosticsSummary = new LinkedHashMap<String, Object>();
+    diagnostics = dedupeDiagnostics(diagnostics, diagnosticsSummary);
     Map<String, Object> result = new LinkedHashMap<String, Object>();
     result.put("success", false);
     result.put("engine", "jps");
@@ -1728,6 +1746,7 @@ public final class SimpleIde {
     result.put("cancelled", "CANCELLED".equals(errorCode));
     result.put("diagnostics", diagnostics);
     result.put("problems", toProblems(diagnostics));
+    result.putAll(diagnosticsSummary);
     if (rebuildRequired) {
       result.put("rebuildRequired", true);
       if (runningConfigurations != null) result.put("runningConfigurations", runningConfigurations);
@@ -1735,6 +1754,7 @@ public final class SimpleIde {
     if (rebuildReason != null) result.put("rebuildReason", rebuildReason);
     attachBuildMetadata(result, project, tracker, jpsJar, timeoutSec, -1);
     applyIsolationFields(result, isolation);
+    attachAutoRestartFields(result, tracker);
     String resultJson = json(result);
     if (jsonOut != null) jsonOut.println(resultJson);
     if (tracker != null) tracker.finish("FAILED", exitCode, errorCode);
@@ -1927,6 +1947,323 @@ public final class SimpleIde {
   }
 
   /** 执行实际编译逻辑：优先使用 JPS 增量编译引擎，支持降级到 IDEA MCP。 */
+  /**
+   * 检测到运行中应用时，按需执行「停止应用 → 共享输出编译 → 重启」的前置编排。
+   *
+   * 只有「存在待编译源文件」时才停应用，避免无改动构建白白中断服务；显式要求隔离
+   * （--isolate-cache / SIMPLE_IDE_ISOLATE_CACHE）或 --no-auto-restart 时保持原有保护行为。
+   *
+   * @param project 项目根目录
+   * @param tracker 构建跟踪器，可为 null
+   * @param autoRestartEnabled 是否允许自动停用并重启（由 --no-auto-restart 关闭）
+   * @return 重启计划；为空表示本次不需要停/重启
+   */
+  static List<Map<String, Object>> prepareAutoRestart(Path project, BuildTracker tracker, boolean autoRestartEnabled) {
+    List<Map<String, Object>> empty = new ArrayList<Map<String, Object>>();
+    List<String> running = runningConfigurations(project);
+    if (running.isEmpty()) return empty;
+    boolean isolateRequested = truthyEnv("SIMPLE_IDE_ISOLATE_CACHE");
+    boolean autoRestartDisabled = !autoRestartEnabled || truthyEnv("SIMPLE_IDE_NO_AUTO_RESTART");
+    if (isolateRequested || autoRestartDisabled) {
+      if (tracker != null) {
+        tracker.message("已显式要求隔离构建或禁用自动重启，运行中的应用 " + running + " 保持不变");
+        tracker.put("autoRestartSkipped", isolateRequested ? "isolate_requested" : "auto_restart_disabled");
+      }
+      return empty;
+    }
+
+    PendingSources pending = detectPendingSources(project);
+    if (!pending.dirty()) {
+      if (tracker != null) {
+        tracker.message("检测到运行中的应用 " + running + "，但未发现比编译产物更新的源文件"
+          + (pending.newest.isEmpty() ? "" : "（最近源文件：" + pending.newest + "）")
+          + "；本次不停用应用，沿用原保护策略");
+        tracker.put("autoRestartSkipped", "no_pending_sources");
+      }
+      return empty;
+    }
+
+    List<Map<String, Object>> plan = snapshotRestartPlan(project, running);
+    if (tracker != null) {
+      tracker.message("检测到运行中的应用 " + running + " 与 " + pending.count + " 个待编译源文件"
+        + "（最近改动：" + pending.newest + "）：先停止应用 → 用共享输出编译 → 编译成功后按原参数重启；"
+        + "编译失败不会自动重启，需要手动 run 恢复");
+      tracker.put("autoRestart", true);
+      tracker.put("stoppedApplications", running);
+      tracker.put("pendingSourceCount", Integer.valueOf(pending.count));
+      tracker.put("pendingNewestSource", pending.newest);
+    }
+    for (String configuration : running) {
+      stopApplication(project, configuration);
+    }
+    return plan;
+  }
+
+  /** 诊断条目输出上限：超出部分只保留计数，避免单个文件的过期 API 警告刷爆 JSON。 */
+  private static final int DIAGNOSTICS_OUTPUT_LIMIT = 200;
+
+  /**
+   * 诊断去重与汇总：同一 (severity, message) 只保留一条并附出现次数。
+   *
+   * 真实项目里同一文件常有数百条同规则 WARN（如「XXX 已过时」），逐条输出会把 JSON 刷到几百 KB，
+   * 调用方只能再写脚本提取；这里改成去重 + 计数，并补充 diagnosticsTotal/diagnosticsSummary。
+   *
+   * @param diagnostics 原始诊断列表
+   * @param summaryOut 汇总输出（写入 diagnosticsTotal/diagnosticsSummary/diagnosticsUnique/可选 diagnosticsTruncated）
+   * @return 去重后的诊断列表（最多 DIAGNOSTICS_OUTPUT_LIMIT 条）
+   */
+  static List<Map<String, Object>> dedupeDiagnostics(List<Map<String, Object>> diagnostics,
+                                                    Map<String, Object> summaryOut) {
+    Map<String, Map<String, Object>> uniqueByKey = new LinkedHashMap<String, Map<String, Object>>();
+    Map<String, Object> severityCount = new LinkedHashMap<String, Object>();
+    int total = 0;
+    if (diagnostics != null) {
+      for (Map<String, Object> item : diagnostics) {
+        if (item == null) continue;
+        total++;
+        String severity = String.valueOf(item.get("severity"));
+        Object previousSeverity = severityCount.get(severity);
+        severityCount.put(severity, Integer.valueOf(previousSeverity == null ? 1 : ((Number) previousSeverity).intValue() + 1));
+        String key = severity + "|" + item.get("message");
+        Map<String, Object> existing = uniqueByKey.get(key);
+        if (existing == null) {
+          Map<String, Object> copy = new LinkedHashMap<String, Object>(item);
+          copy.put("count", Integer.valueOf(1));
+          uniqueByKey.put(key, copy);
+        }
+        else {
+          existing.put("count", Integer.valueOf(((Number) existing.get("count")).intValue() + 1));
+        }
+      }
+    }
+    List<Map<String, Object>> unique = new ArrayList<Map<String, Object>>(uniqueByKey.values());
+    if (summaryOut != null) {
+      summaryOut.put("diagnosticsTotal", Integer.valueOf(total));
+      summaryOut.put("diagnosticsUnique", Integer.valueOf(unique.size()));
+      summaryOut.put("diagnosticsSummary", severityCount);
+      if (unique.size() > DIAGNOSTICS_OUTPUT_LIMIT) {
+        summaryOut.put("diagnosticsTruncated", Integer.valueOf(unique.size() - DIAGNOSTICS_OUTPUT_LIMIT));
+        return new ArrayList<Map<String, Object>>(unique.subList(0, DIAGNOSTICS_OUTPUT_LIMIT));
+      }
+    }
+    return unique;
+  }
+
+  /**
+   * 把「自动停编启」编排结果注入构建 JSON，供调用方感知应用被停止与重启。
+   *
+   * 存在 stoppedApplications 但没有 restartedApplications 时，标记为「构建失败导致未重启」，
+   * 避免调用方误以为应用仍在运行。
+   *
+   * @param result 构建结果 JSON
+   * @param tracker 构建跟踪器，可为 null
+   */
+  static void attachAutoRestartFields(Map<String, Object> result, BuildTracker tracker) {
+    if (tracker == null) return;
+    Map<String, Object> snapshot = tracker.snapshot();
+    String[] keys = {"autoRestart", "autoRestartSkipped", "stoppedApplications",
+      "pendingSourceCount", "pendingNewestSource", "restartedApplications"};
+    for (String key : keys) {
+      if (snapshot.containsKey(key)) result.put(key, snapshot.get(key));
+    }
+    if (snapshot.containsKey("stoppedApplications") && !snapshot.containsKey("restartedApplications")) {
+      result.put("restartSkippedBecauseBuildFailed", true);
+    }
+  }
+
+  /** 待编译源文件探测结果。 */
+  static final class PendingSources {
+    final int count;
+    final String newest;
+    final boolean compiled;
+
+    PendingSources(int count, String newest, boolean compiled) {
+      this.count = count;
+      this.newest = newest;
+      this.compiled = compiled;
+    }
+
+    /** 是否存在需要编译的源文件。 */
+    boolean dirty() {
+      return count > 0;
+    }
+  }
+
+  /** 参与「待编译」比较的源文件根（相对项目根）。 */
+  private static final String[] PENDING_SOURCE_ROOTS = {
+    "src/main/java", "src/main/kotlin", "src/main/resources",
+    "src/test/java", "src/test/kotlin", "src/test/resources"};
+
+  /** 参与「待编译」比较的编译输出根（相对项目根，兼容 Maven 与 Gradle 布局）。 */
+  private static final String[] PENDING_OUTPUT_ROOTS = {
+    "target/classes", "target/test-classes", "target/generated-sources/annotations",
+    "build/classes/java/main", "build/classes/java/test", "build/resources/main", "build/resources/test"};
+
+  /**
+   * 探测是否存在比编译产物更新的源文件，仅用于构建前提示，不参与保护策略判定。
+   *
+   * @param project 项目根目录
+   * @return 待编译文件数、最近改动文件与是否已存在编译产物
+   */
+  static PendingSources detectPendingSources(Path project) {
+    List<Path> sources = new ArrayList<Path>();
+    for (String rel : PENDING_SOURCE_ROOTS) {
+      Path path = project.resolve(rel);
+      if (Files.isDirectory(path)) sources.add(path);
+    }
+    long newestOutput = 0L;
+    boolean compiled = false;
+    for (String rel : PENDING_OUTPUT_ROOTS) {
+      Path path = project.resolve(rel);
+      if (!Files.isDirectory(path)) continue;
+      compiled = true;
+      long mtime = newestModifiedMillis(path);
+      if (mtime > newestOutput) newestOutput = mtime;
+    }
+
+    int count = 0;
+    String newest = "";
+    long newestMtime = 0L;
+    for (Path root : sources) {
+      try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+        java.util.Iterator<Path> iterator = walk.iterator();
+        while (iterator.hasNext()) {
+          Path file = iterator.next();
+          if (!Files.isRegularFile(file)) continue;
+          long mtime = Files.getLastModifiedTime(file).toMillis();
+          if (mtime > newestMtime) {
+            newestMtime = mtime;
+            newest = project.relativize(file).toString();
+          }
+          if (!compiled || mtime > newestOutput) count++;
+        }
+      }
+      catch (Exception ignored) {
+      }
+    }
+    return new PendingSources(count, newest, compiled);
+  }
+
+  /** 递归取目录下最新的文件修改时间（毫秒）；无文件或读取失败时返回 0。 */
+  static long newestModifiedMillis(Path root) {
+    long newest = 0L;
+    try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+      java.util.Iterator<Path> iterator = walk.iterator();
+      while (iterator.hasNext()) {
+        Path file = iterator.next();
+        if (!Files.isRegularFile(file)) continue;
+        long mtime = Files.getLastModifiedTime(file).toMillis();
+        if (mtime > newest) newest = mtime;
+      }
+    }
+    catch (Exception ignored) {
+    }
+    return newest;
+  }
+
+  /**
+   * 快照运行中应用的原始启动参数，供构建后按原参数重启。
+   *
+   * @param project 项目根目录
+   * @param configurations 运行中的配置名
+   * @return 每项包含 configuration / port / debugPort / java
+   */
+  static List<Map<String, Object>> snapshotRestartPlan(Path project, List<String> configurations) {
+    List<Map<String, Object>> plan = new ArrayList<Map<String, Object>>();
+    for (String configuration : configurations) {
+      Map<String, Object> item = new LinkedHashMap<String, Object>();
+      item.put("configuration", configuration);
+      int port = -1;
+      int debugPort = -1;
+      String java = "";
+      try {
+        RunState state = RunState.read(runState(project, configuration));
+        if (state != null) {
+          port = state.port;
+          debugPort = state.debugPort;
+          if (state.command != null && !state.command.isEmpty()) {
+            String first = state.command.get(0);
+            if (first != null && (first.endsWith("java") || first.endsWith("java.exe"))) java = first;
+          }
+        }
+      }
+      catch (Exception ignored) {
+      }
+      item.put("port", Integer.valueOf(port));
+      item.put("debugPort", Integer.valueOf(debugPort));
+      item.put("java", java);
+      plan.add(item);
+    }
+    return plan;
+  }
+
+  /**
+   * 由重启计划项构造重启命令行：用当前 simple-ide 的 classpath 再次执行 run，
+   * 跳过前置编译（本次构建已完成），避免与其它运行中应用互相拦截。
+   *
+   * @param project 项目根目录
+   * @param item 重启计划项
+   * @return 命令参数列表
+   */
+  static List<String> restartCommand(Path project, Map<String, Object> item) {
+    String configuration = String.valueOf(item.get("configuration"));
+    String java = item.get("java") == null ? "" : String.valueOf(item.get("java"));
+    List<String> argv = new ArrayList<String>();
+    argv.add(java.isEmpty() || "null".equals(java)
+      ? Paths.get(System.getProperty("java.home"), "bin", "java").toString() : java);
+    argv.add("-cp");
+    argv.add(System.getProperty("java.class.path"));
+    argv.add(SimpleIde.class.getName());
+    argv.add("run");
+    argv.add("--project");
+    argv.add(project.toAbsolutePath().toString());
+    argv.add("--configuration");
+    argv.add(configuration);
+    int port = item.get("port") instanceof Number ? ((Number) item.get("port")).intValue() : -1;
+    int debugPort = item.get("debugPort") instanceof Number ? ((Number) item.get("debugPort")).intValue() : -1;
+    if (port > 0) {
+      argv.add("--port");
+      argv.add(String.valueOf(port));
+    }
+    if (debugPort > 0) {
+      argv.add("--debug-port");
+      argv.add(String.valueOf(debugPort));
+    }
+    argv.add("--engine");
+    argv.add("local");
+    argv.add("--skip-build");
+    return argv;
+  }
+
+  /**
+   * 按原参数逐个重启应用（独立子进程执行 run，避免 run 内部的 System.exit 终止本次构建进程）。
+   *
+   * @param project 项目根目录
+   * @param plan 重启计划
+   * @return 每个应用的重启结果（configuration / success / exitCode）
+   */
+  static List<Map<String, Object>> restartApplications(Path project, List<Map<String, Object>> plan) {
+    List<Map<String, Object>> results = new ArrayList<Map<String, Object>>();
+    for (Map<String, Object> item : plan) {
+      Map<String, Object> result = new LinkedHashMap<String, Object>();
+      result.put("configuration", String.valueOf(item.get("configuration")));
+      try {
+        ProcessRunner.Result run = ProcessRunner.run(restartCommand(project, item), project, 900, true, 64 * 1024, null, null);
+        result.put("exitCode", Integer.valueOf(run.exitCode));
+        result.put("success", Boolean.valueOf(run.exitCode == 0));
+        if (run.exitCode != 0) {
+          result.put("error", run.stdout == null ? "" : run.stdout.trim());
+        }
+      }
+      catch (Exception e) {
+        result.put("success", Boolean.FALSE);
+        result.put("error", e.getMessage());
+      }
+      results.add(result);
+    }
+    return results;
+  }
+
   private static void executeBuild(Command command, Path project, BuildTracker tracker) throws Exception {
     List<String> modules = command.values("module");
     List<String> files = command.values("file");
@@ -1939,7 +2276,8 @@ public final class SimpleIde {
 
     BuildStatus status = null;
     if ("jps".equalsIgnoreCase(requestedEngine)) {
-      status = buildViaJps(project, modules, files, timeoutSec, explicitRebuild, autoRebuild, forceIsolateCache, noIsolateCache, tracker, System.out);
+      status = buildViaJps(project, modules, files, timeoutSec, explicitRebuild, autoRebuild, forceIsolateCache, noIsolateCache,
+        !command.flag("no-auto-restart"), tracker, System.out);
       if (status == null && command.option("engine", null) == null) {
         status = buildViaMcp(project, modules, files, timeoutSec, explicitRebuild || autoRebuild);
       }
@@ -2007,10 +2345,10 @@ public final class SimpleIde {
       }
       BuildStatus buildStatus;
       if (skipLock) {
-        buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
+        buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
       } else {
         try (BuildLock ignored = BuildLock.acquire(project)) {
-          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
+          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
         }
       }
       if (buildStatus != null && !buildStatus.success) {
@@ -2034,6 +2372,12 @@ public final class SimpleIde {
     }
 
     List<String> vmParams = split(configuration.vmParameters);
+    // 追加调用方显式传入的 JVM 参数（--vm-arg，可重复）：供启动期 profiling（-agentpath）、临时系统属性等使用；
+    // 参数原样透传不拆分，避免路径/等号/逗号被误解析，最终插在 -cp 之前。
+    List<String> extraVmArgs = command.values("vm-arg");
+    if (extraVmArgs != null && !extraVmArgs.isEmpty()) {
+      vmParams.addAll(extraVmArgs);
+    }
     int debugPort = resolveDebugPort(command, vmParams);
     Path runDirectory = project.resolve(".simple-ide/runs");
     Files.createDirectories(runDirectory);
@@ -2380,9 +2724,41 @@ public final class SimpleIde {
   }
 
   /**
+   * 组装测试子进程类路径，用内置运行器配套的 JUnit 替换项目中的同名框架依赖。
+   * 保留项目输出、业务依赖及未由运行器提供的扩展，避免新 launcher 加载旧 commons/engine。
+   *
+   * @param projectClasspath 项目输出与依赖类路径
+   * @param runtimeEntries 内置运行器及配套依赖
+   * @return 不混用同名 JUnit 组件版本的测试类路径
+   */
+  static String buildTestClasspath(String projectClasspath, List<Path> runtimeEntries) {
+    Set<String> bundledArtifacts = new LinkedHashSet<String>();
+    for (Path entry : runtimeEntries) {
+      String artifact = testFrameworkArtifact(entry);
+      if (artifact != null) bundledArtifacts.add(artifact);
+    }
+    Set<String> entries = new LinkedHashSet<String>();
+    for (String entry : projectClasspath.split(Pattern.quote(File.pathSeparator))) {
+      if (entry.isEmpty()) continue;
+      String artifact = testFrameworkArtifact(Paths.get(entry));
+      if (artifact == null || !bundledArtifacts.contains(artifact)) entries.add(entry);
+    }
+    for (Path entry : runtimeEntries) entries.add(entry.toString());
+    return String.join(File.pathSeparator, entries);
+  }
+
+  /** 返回测试框架 Jar 的无版本组件名，非框架依赖返回 null。 */
+  private static String testFrameworkArtifact(Path entry) {
+    if (entry.getFileName() == null) return null;
+    Matcher matcher = Pattern.compile("^(junit(?:-[a-z-]+)?|opentest4j|apiguardian-api)-[0-9].*\\.jar$")
+      .matcher(entry.getFileName().toString());
+    return matcher.matches() ? matcher.group(1) : null;
+  }
+
+  /**
    * 通过内置 JPS 增量编译产物与本地 JUnit 平台执行测试。
    *
-   * <p>可靠性约束：按目标模块解析精确 Classpath；子进程有边界超时并回收进程树；
+   * <p>可靠性约束：按目标模块解析精确 Classpath，并统一内置 JUnit 组件版本；子进程有边界超时并回收进程树；
    * 测试结果用真实 JSON 解析判定 success，不再用字符串 contains 猜测。
    *
    * @param project 目标项目根目录
@@ -2427,7 +2803,8 @@ public final class SimpleIde {
       return new TestStatus(true, false, errJson);
     }
 
-    // 引入 simple-ide 运行时 lib（含 LocalTestRunner 与 JUnit Platform 引擎）
+    // 引入 simple-ide 运行时 lib，并替换项目内与运行器冲突的 JUnit 组件
+    List<Path> runtimeEntries = new ArrayList<Path>();
     try {
       URL location = SimpleIde.class.getProtectionDomain().getCodeSource().getLocation();
       if (location != null) {
@@ -2437,7 +2814,7 @@ public final class SimpleIde {
           File[] jars = dir.toFile().listFiles((d, name) -> name.endsWith(".jar"));
           if (jars != null) {
             for (File j : jars) {
-              cpBuilder.append(j.getAbsolutePath()).append(File.pathSeparator);
+              runtimeEntries.add(j.toPath().toAbsolutePath());
             }
           }
         }
@@ -2448,7 +2825,7 @@ public final class SimpleIde {
     List<String> processCommand = new ArrayList<String>();
     processCommand.add("java");
     processCommand.add("-cp");
-    processCommand.add(cpBuilder.toString());
+    processCommand.add(buildTestClasspath(cpBuilder.toString(), runtimeEntries));
     processCommand.add("io.simpleide.LocalTestRunner");
     processCommand.add(testClass);
     if (method != null) {
@@ -2635,10 +3012,10 @@ public final class SimpleIde {
         if (moduleHint != null && !moduleHint.trim().isEmpty()) buildModules.add(moduleHint);
         BuildStatus buildStatus;
         if (skipLock) {
-          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
+          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
         } else {
           try (BuildLock ignored = BuildLock.acquire(project)) {
-            buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, null, null);
+            buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
           }
         }
         if (buildStatus != null && !buildStatus.success) {
@@ -4554,9 +4931,9 @@ public final class SimpleIde {
     if (command == null || "help".equals(command) || "--help".equals(command) || "-h".equals(command))
       return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  build-status  查询最近一次构建的真实阶段/耗时/日志/失败原因\n  version 打印工具版本、jps-cli 摘要与缓存格式版本\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
     if ("list".equals(command)) return "用法: simple-ide list [--project <path>] [--running-only] [--clean] [--stop-all] [--table]\n\n列出 simple-ide 启动的所有应用并集中管控（支持跨项目汇总、展示 PID/端口/状态/日志；--running-only 仅看存活应用；--stop-all 一键集中停止所有应用；--clean 清理失效状态记录；--table 以表格格式输出）。\n";
-    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n";
-    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build]\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port。\n";
-    if ("debug".equals(command)) return "用法: simple-ide debug --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build]\n\n调试启动 Application（对齐 IDEA Debug 模式）。默认开启 JDWP 远程调试（默认端口 5005，可通过 --debug-port 自定义）。--random-port 自动选择空闲端口并传入 --server.port。\n";
+    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--no-auto-restart] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n存在运行中的应用且检测到待编译源文件时，默认先停止应用 → 用共享输出编译 → 成功后按原参数重启（避免改动只写进隔离目录、运行时仍是旧 class）；无待编译文件则不动应用。--no-auto-restart 关闭该行为。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n";
+    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
+    if ("debug".equals(command)) return "用法: simple-ide debug --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--vm-arg <arg>]...\n\n调试启动 Application（对齐 IDEA Debug 模式）。默认开启 JDWP 远程调试（默认端口 5005，可通过 --debug-port 自定义）。--random-port 自动选择空闲端口并传入 --server.port。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
     if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>] [--module <artifactId>] [--engine <jps|idea-mcp>] [--skip-build] [--timeout <sec>]\n\n运行单元测试。默认通过内置 JPS 增量编译并在本地 JUnit 平台执行，秒级反馈，不依赖 IDEA 运行。\n未指定 --module 时按测试源码所在模块推断作用域；多模块且无法唯一确定时显式报错。\n结果 JSON 通过真实解析判定 success，并区分 failed/skipped/aborted/notExecuted/containersFailed。\n";
     if ("status".equals(command)) return "用法: simple-ide status --project <path> [--configuration <name>] [--engine <local|idea-mcp>]\n\n默认 --engine local 查询本地运行状态；--engine idea-mcp 查询已运行的 IDEA MCP 状态。\n";
     if ("build-status".equals(command)) return "用法: simple-ide build-status [--project <path>] [--build <buildId|latest>] [--tail <lines>]\n\n查询构建真实状态：phase、state、pid、startedAt、durationMs、logFile、exitCode、errorCode。\n不提供百分比或 ETA；长构建期间进度与心跳输出在 stderr。\n";
@@ -5110,8 +5487,47 @@ public final class SimpleIde {
       value.put("status", status);
       value.put("running", true);
       value.put("log", log.toString());
-      value.put("command", command);
+      // 命令只输出折叠摘要：完整启动命令含超长 classpath，直接内嵌会让 status/list 输出刷屏
+      value.put("command", commandSummary());
+      value.put("commandNote", "已折叠 -cp 的 classpath；完整启动命令见 .simple-ide/runs 下同名 .properties");
       return value;
+    }
+
+    /**
+     * 生成启动命令摘要：把 -cp/-classpath 后的超长 classpath 折叠为「条目数 + 字符数」。
+     *
+     * 完整启动命令仍完整保存在 .simple-ide/runs/&lt;配置&gt;.properties，排障时直接读该文件即可。
+     *
+     * @return 折叠后的命令摘要；无命令时返回空串
+     */
+    String commandSummary() {
+      if (command == null || command.isEmpty()) return "";
+      StringBuilder summary = new StringBuilder();
+      for (int i = 0; i < command.size(); i++) {
+        String arg = command.get(i);
+        if (summary.length() > 0) summary.append(' ');
+        if ("-cp".equals(arg) || "-classpath".equals(arg) || "--class-path".equals(arg)) {
+          String classpath = (i + 1 < command.size()) ? command.get(i + 1) : "";
+          summary.append(arg).append(" <classpath: ").append(classpathEntryCount(classpath))
+            .append(" 项, ").append(classpath.length()).append(" 字符>");
+          i++;
+          continue;
+        }
+        summary.append(arg);
+      }
+      return summary.toString();
+    }
+
+    /**
+     * 统计 classpath 字符串包含的条目数。
+     *
+     * @param classpath classpath 字符串（Linux 用 ':'、Windows 用 ';' 分隔）
+     * @return 条目数；空串返回 0
+     */
+    static int classpathEntryCount(String classpath) {
+      if (classpath == null || classpath.isEmpty()) return 0;
+      String separator = classpath.indexOf(';') >= 0 && classpath.indexOf(':') < 0 ? ";" : ":";
+      return classpath.split(java.util.regex.Pattern.quote(separator), -1).length;
     }
   }
 
