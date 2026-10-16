@@ -59,7 +59,7 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 - 本地运行读取 `.idea/runConfigurations/<name>.xml`，不存在时读取 `.idea/workspace.xml` 中同名 Application 配置。这里的 XML 是配置文件，不代表启动 IDEA。
 - 配置提供主类、模块、VM 参数、程序参数和工作目录；classpath 按运行配置的模块解析（`target/classes`/`target/test-classes` 与 `.jps-deps/classpath-<module>.cache`，回退兼容旧位置 `.jps-cache/classpath-*.cache`）；缓存列出的 Jar 缺失时会显式告警，不静默使用残缺缓存。
 - 默认先执行 JPS 增量编译。`--skip-build` 跳过增量编译直接复用已有 class 与 classpath 缓存，毫秒级快速拉起。
-- `--port <n>` 固定端口；`--random-port` 选空闲端口并注入 `--server.port`；两者择一。
+- `--port <n>` 固定端口；`--random-port` 选空闲端口并注入 `--server.port`；两者择一。**都不指定时，端口由 `status`/`list`/`npm status` 从进程监听套接字自动探测**（过滤 DevTools LiveReload `35729` 与 JDWP 调试端口；多候选时优先采信启动日志里框架自报的端口，否则取最小端口），无需事先声明。
 - 返回 `STARTING` / `running:true` 只代表进程已创建，不证明应用就绪。返回的 `pid`、`port`、`debugPort`、`log` 用于后续检查。
 
 ## 状态、集中管控与停止
@@ -75,7 +75,7 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 - `list` 集中管控所有由 simple-ide 启动的应用。不带 `--project` 时自动汇聚全局已知项目的所有服务，展示应用名、类型（java/npm）、PID、状态、端口、调试端口与日志；`--running-only` 仅看存活应用；`--clean` 清理失效状态记录；`--stop-all` 一键集中停止所有应用；`--table` 以整齐表格格式输出。
 - 当前版本 `status/stop` 默认 `local`；进程不存在时返回停止状态并清理过期状态，不回退 MCP。显式 `--engine idea-mcp` 只连接已运行的 MCP，不可用则报错。
 - `report` 生成并自动在浏览器中打开本地 HTML 运行仪表盘（`.simple-ide/reports/report.html`），展示关联应用（配置、PID、端口、调试端口、状态与日志）、最近测试执行结果与失败清单、以及命令历史记录。`--no-open` 仅生成文件而不主动打开浏览器。
-- 状态文件在 `.simple-ide/runs/`；构建状态与日志在 `.simple-ide/builds/`；Java 状态 `RUNNING` 仍需业务健康检查确认就绪。
+- 状态文件在 `.simple-ide/runs/`；构建状态与日志在 `.simple-ide/builds/`；Java 状态 `RUNNING` 仍需业务健康检查确认就绪。状态里的端口优先取启动时的 `--port/--random-port`，未指定时自动探测进程监听端口（进程未监听则保持 `STARTING`，页面/接口是否就绪仍以业务健康检查为准）。
 - 日志默认追加，避免把历史启动成功文案当成本轮结果；优先读取本轮尾部，不输出完整日志或完整 classpath 命令。
 
 ## npm 脚本管理

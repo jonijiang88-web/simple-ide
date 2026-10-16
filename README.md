@@ -59,6 +59,8 @@ JPS 的增量存储在打开失败时会**先删除缓存目录（`.jps-cache`�
 
 `run --random-port` 会由 CLI 选择空闲端口并传入 `--server.port=<port>`。`status` 返回 `projectPath`、`pid`、`port`、`debugPort` 和 `status`：端口监听后为 `RUNNING`，初始化期间为 `STARTING`。进程退出后，CLI 自动删除陈旧状态文件，仅返回 `STOPPED`，不会返回过期 PID 或端口。
 
+未指定 `--port/--random-port` 时无需手工补端口：`status`/`list`/`npm status` 会从进程监听套接字自动探测主端口（过滤 DevTools LiveReload `35729` 与 JDWP 调试端口；多候选时优先采信启动日志里框架自报的端口，否则取最小端口），探测结果只用于输出与状态判定，不回写状态文件。
+
 前端 npm 服务使用相同的进程管理逻辑：
 
 ```bash
