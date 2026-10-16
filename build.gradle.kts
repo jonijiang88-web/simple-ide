@@ -6,14 +6,19 @@ repositories {
   mavenCentral()
 }
 
+// 独立解析旧版项目依赖，回归测试必须在子进程中复现新旧 JUnit 混用。
+val legacyJUnitTestClasspath by configurations.creating
+
 dependencies {
   implementation(fileTree("lib") { include("*.jar") })
   implementation("org.junit.platform:junit-platform-launcher:1.11.4")
   implementation("org.junit.jupiter:junit-jupiter-engine:5.11.4")
+  implementation("org.junit.jupiter:junit-jupiter-params:5.11.4")
   implementation("org.junit.vintage:junit-vintage-engine:5.11.4")
   testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
   // LocalTestRunner 需要同时验证 JUnit 4（经 Vintage 引擎）链路
   testImplementation("junit:junit:4.13.2")
+  legacyJUnitTestClasspath("org.junit.jupiter:junit-jupiter:5.8.2")
 }
 
 java {
@@ -49,6 +54,8 @@ distributions {
 }
 
 tasks.test {
+  systemProperty("simple.ide.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
+  systemProperty("simple.ide.test.legacy-junit-classpath", legacyJUnitTestClasspath.asPath)
   useJUnitPlatform {
     excludeTags("fixture")
   }

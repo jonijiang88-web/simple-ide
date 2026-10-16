@@ -76,6 +76,8 @@ JPS 的增量存储在打开失败时会**先删除缓存目录（`.jps-cache`�
 
 已内置 `jps-cli` 增量构建与测试引擎：自动解析 Maven `pom.xml` 依赖与模块拓扑，优先通过 JPS 执行秒级增量构建（零改动 ~700ms，单文件改动 ~1.5s），并结合内置 JUnit 平台执行本地测试，无需打开 IDEA 界面或运行 MCP 插件。
 
+本地测试使用随工具打包的 JUnit Platform、Jupiter（含参数化测试）及 Vintage。测试子进程会替换项目中这些组件的同名旧版 Jar，避免新版 launcher 与旧版 commons/engine 混用；项目输出、业务依赖和第三方测试扩展仍保留。该替换只作用于测试进程，不修改项目依赖配置或应用运行类路径。
+
 ## 分发
 
 Linux/macOS 运行 `./package.sh`，Windows PowerShell 运行 `.\package.ps1`；脚本强制重建并运行单元测试，生成同一个 `build/distributions/simple-ide.zip` 和 SHA-256 校验文件。
