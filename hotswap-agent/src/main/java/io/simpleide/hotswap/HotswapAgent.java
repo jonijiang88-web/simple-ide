@@ -147,6 +147,8 @@ public final class HotswapAgent {
       List<String> classPaths = Files.readAllLines(request, StandardCharsets.UTF_8);
       List<String> skipped = new ArrayList<String>();
       int reloaded = 0;
+      HotswapRuntime runtime = HotswapRuntime.getInstance();
+      runtime.beginBatch();
       try {
         for (String line : classPaths) {
           String relative = line.trim();
@@ -183,6 +185,7 @@ public final class HotswapAgent {
         log("request " + id + ": HOTSWAP_FAILED " + error);
       }
       finally {
+        runtime.endBatch();
         Files.deleteIfExists(request);
       }
     }

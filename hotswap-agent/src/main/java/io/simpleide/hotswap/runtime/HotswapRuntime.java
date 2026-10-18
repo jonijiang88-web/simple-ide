@@ -12,6 +12,8 @@ import io.simpleide.hotswap.api.VersionClassGenerator;
 import io.simpleide.hotswap.classify.AsmSchemaClassifier;
 import io.simpleide.hotswap.dispatch.ReflectionMethodDispatcher;
 import io.simpleide.hotswap.facade.AsmClassInstrumenter;
+import io.simpleide.hotswap.plugin.HotswapReloadEvent;
+import io.simpleide.hotswap.plugin.PluginManager;
 import io.simpleide.hotswap.state.ReflectionStateMigrator;
 import io.simpleide.hotswap.state.SharedStaticState;
 import io.simpleide.hotswap.state.StaticAccessRewriter;
@@ -58,6 +60,7 @@ public final class HotswapRuntime implements OriginalClassStore {
   private final SharedStaticState staticState = SharedStaticState.getInstance();
   private final StaticAccessRewriter staticRewriter = new StaticAccessRewriter();
   private final SchemaClassifier classifier = new AsmSchemaClassifier();
+  private final PluginManager pluginManager = new PluginManager();
   private final Object monitor = new Object();
 
   private volatile Instrumentation instrumentation;
@@ -85,6 +88,7 @@ public final class HotswapRuntime implements OriginalClassStore {
     this.instrumentation = inst;
     this.includePrefix = includePrefix == null ? "" : includePrefix.trim();
     inst.addTransformer(new FacadeTransformer(), false);
+    pluginManager.initialize(inst);
   }
 
   /**
@@ -114,6 +118,56 @@ public final class HotswapRuntime implements OriginalClassStore {
   }
 
   /**
+   * 返回 facade 的当前版本类；未版本化时返回 facade 自身。
+   *
+   * @param facadeClass facade 类
+   * @return 当前版本类
+   */
+  public static Class<?> effectiveClass(Class<?> facadeClass) {
+    return INSTANCE.effectiveClassOf(facadeClass);
+  }
+
+  /**
+   * 把 facade 对象转换为当前版本对象；非 facade 原样返回。
+   *
+   * @param value facade 或普通对象
+   * @return 当前版本对象或原对象
+   * @throws Exception 版本创建失败
+   */
+  public static Object currentVersionOrSelf(Object value) throws Exception {
+    if (value == null || !INSTANCE.isFacadeClass(value.getClass())) {
+      return value;
+    }
+    return currentVersion(value);
+  }
+
+  /**
+   * 创建一个 facade 外壳并绑定指定版本对象，供 Jackson/MyBatis 等框架回填。
+   *
+   * @param facadeClass facade 类
+   * @param version 版本对象
+   * @return facade 对象
+   * @throws Exception facade 或版本对象无效时抛出
+   */
+  public static Object wrapFacade(Class<?> facadeClass, Object version) throws Exception {
+    return INSTANCE.wrapFacadeObject(facadeClass, version);
+  }
+
+  /**
+   * 开始批量热替换，插件事件在批次结束后统一分发。
+   */
+  public static void beginBatch() {
+    INSTANCE.pluginManager.beginBatch();
+  }
+
+  /**
+   * 结束批量热替换并分发插件事件。
+   */
+  public static void endBatch() {
+    INSTANCE.pluginManager.endBatch();
+  }
+
+  /**
    * 热替换一个类。
    *
    * <p>已被 facade 改写的类走版本化；未改写的类回退到 JVM redefineClasses。
@@ -137,12 +191,14 @@ public final class HotswapRuntime implements OriginalClassStore {
         byte[] previous = unsupportedOriginalBytes.get(className);
         if (previous != null && classifier.classify(previous, newBytes) == ChangeKind.METHOD_BODY) {
           instrumentation.redefineClasses(new ClassDefinition(original, newBytes));
+          firePluginEvent(className, original, null, ChangeKind.METHOD_BODY);
           return;
         }
         throw new UnsupportedOperationException(unsupported
           + ": class versioning cannot safely reload this class; restart the application");
       }
       instrumentation.redefineClasses(new ClassDefinition(original, newBytes));
+      firePluginEvent(className, original, null, ChangeKind.METHOD_BODY);
       return;
     }
     synchronized (monitor) {
@@ -162,6 +218,7 @@ public final class HotswapRuntime implements OriginalClassStore {
           // 还没有 V0：直接以新字节作为首次版本基线，避免创建后再 retransform。
           state.original = newBytes.clone();
           state.currentBytes = newBytes.clone();
+          firePluginEvent(className, original, null, ChangeKind.METHOD_BODY);
           return;
         }
         byte[] versionBytes = versionGenerator.generate(newBytes, className,
@@ -169,6 +226,7 @@ public final class HotswapRuntime implements OriginalClassStore {
         versionBytes = staticRewriter.rewriteVersion(versionBytes, className);
         retransformVersion(state.currentVersionClass, versionBytes);
         state.currentBytes = newBytes.clone();
+        firePluginEvent(className, original, state.currentVersionClass, ChangeKind.METHOD_BODY);
         return;
       }
       int number = state.counter.getAndIncrement();
@@ -182,6 +240,7 @@ public final class HotswapRuntime implements OriginalClassStore {
         delegateField(original).set(facade, next);
         recordVersionHistory(facade, next);
       }
+      firePluginEvent(className, original, versionClass, kind);
     }
   }
 
@@ -229,6 +288,76 @@ public final class HotswapRuntime implements OriginalClassStore {
         state.currentBytes = bytes.clone();
       }
     }
+  }
+
+  /**
+   * 解析 facade 的当前版本类。
+   *
+   * @param facadeClass facade 类
+   * @return 当前版本类或 facade 自身
+   */
+  private Class<?> effectiveClassOf(Class<?> facadeClass) {
+    if (facadeClass == null) {
+      return null;
+    }
+    VersionState state = stateOf(facadeClass);
+    if (state != null && state.currentVersionClass != null) {
+      return state.currentVersionClass;
+    }
+    return facadeClass;
+  }
+
+  /**
+   * 判断类型是否为已改写的 facade。
+   *
+   * @param type 类型
+   * @return facade 返回 true
+   */
+  private boolean isFacadeClass(Class<?> type) {
+    if (type == null) {
+      return false;
+    }
+    try {
+      type.getDeclaredField(HotswapNames.DELEGATE_FIELD);
+      return true;
+    }
+    catch (NoSuchFieldException ignored) {
+      return false;
+    }
+  }
+
+  /**
+   * 创建 facade 外壳并绑定版本对象。
+   *
+   * @param facadeClass facade 类
+   * @param version 版本对象
+   * @return facade 对象
+   * @throws Exception facade 无效时抛出
+   */
+  private Object wrapFacadeObject(Class<?> facadeClass, Object version) throws Exception {
+    if (facadeClass == null || version == null) {
+      throw new IllegalArgumentException("facadeClass and version must not be null");
+    }
+    if (!isFacadeClass(facadeClass)) {
+      throw new IllegalArgumentException("not a facade class: " + facadeClass.getName());
+    }
+    Object facade = allocate(facadeClass);
+    delegateField(facadeClass).set(facade, version);
+    registerFacade(facadeClass, facade);
+    return facade;
+  }
+
+  /**
+   * 分发一次插件事件；批量模式下由 PluginManager 暂存。
+   *
+   * @param className 点分类名
+   * @param facadeClass facade 类
+   * @param versionClass 当前版本类
+   * @param kind 变更类型
+   */
+  private void firePluginEvent(String className, Class<?> facadeClass, Class<?> versionClass,
+                               ChangeKind kind) {
+    pluginManager.fire(new HotswapReloadEvent(className, facadeClass, versionClass, kind));
   }
 
   /**

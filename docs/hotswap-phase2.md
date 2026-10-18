@@ -90,6 +90,54 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
    - 通过 runtime API 可调用 `extra()`
 4. 静态字段：v1 修改后 reload，v2 仍读到同一值。
 
+## Phase 1 插件基础设施
+
+`hotswap-agent` 新增 `io.simpleide.hotswap.plugin`：
+
+- `HotswapPlugin`：reload 事件回调，支持 `initialize` 注册 transformer
+- `HotswapReloadEvent`：类名、facade、当前版本类、`ChangeKind`
+- `PluginManager`：ServiceLoader 加载、批量事件、单个插件异常隔离
+- `HotswapRuntime.effectiveClass(...)` / `currentVersionOrSelf(...)` / `wrapFacade(...)`
+
+`HotswapAgent` 按一次 request 批量提交，批次结束后统一分发插件事件，避免 MVC 等框架看到半更新状态。
+
+## Phase 2 Spring 插件
+
+`io.simpleide.hotswap.integration.spring`：
+
+- `SpringContextTransformer`：在 `SpringApplication.run(...)` 返回路径捕获 `ApplicationContext`
+- `SpringContextBridge`：agent 与 Spring 类之间的无 Spring 编译依赖桥
+- `SpringPlugin`：
+  - 清理 Spring 注解/内省缓存
+  - 对 schema/signature 变更的 bean 版本对象执行按类型注入
+  - 对 annotation/signature 变更的 Controller，重建 `RequestMappingHandlerMapping` 中的映射
+  - 清理 `ExceptionHandlerExceptionResolver` 的 advice 缓存
+
+支持范围：
+
+- Spring Boot 2.7 / Spring 5.3
+- 已有 Controller 方法体变化
+- 新增或修改 `@RequestMapping` 方法
+- 新字段通过已有访问器使用
+
+暂不支持：
+
+- `@ControllerAdvice` 的结构性变化
+- `@Configuration` / `@Bean` 增删
+- `@Transactional` / `@Cacheable` 等代理注解变化
+- Jackson / MyBatis 元数据（Phase 3/4）
+
+## build 自动 reload
+
+设置 `SIMPLE_IDE_HOTSWAP=1` 且存在同环境启动的运行中应用时，`simple-ide build` 会：
+
+1. 使用 JPS 增量编译到共享 `target/classes`（不停止应用）
+2. 从构建输出中筛选变更 class
+3. 自动提交给 agent，完成一次 reload
+4. 跳过原有的“停止应用 → 编译 → 重启应用”流程
+
+可用 `--configuration <name>` 限定运行配置。构建 JSON 增加 `hotswapReload`（单配置）或 `hotswapReloads`（多配置）。
+
 ## 构建
 
 ```bash
