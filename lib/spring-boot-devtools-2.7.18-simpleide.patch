@@ -1,0 +1,90 @@
+--- orig27/org/springframework/boot/devtools/restart/classloader/RestartClassLoader.java	2023-11-23 07:14:32.000000000 +0800
++++ src27/org/springframework/boot/devtools/restart/classloader/RestartClassLoader.java	2026-10-18 22:14:47.324056475 +0800
+@@ -42,6 +42,21 @@
+  */
+ public class RestartClassLoader extends URLClassLoader implements SmartClassLoader {
+ 
++	/**
++	 * System property used to force selected classes to be loaded parent-first. This is
++	 * required when the application output directory shadows classes that also exist in a
++	 * dependency jar (for example framework patches in {@code src/main/java}); loading
++	 * both copies in different class loaders would violate the JVM class loader
++	 * constraint.
++	 */
++	private static final String PARENT_FIRST_PROPERTY = "spring.devtools.restart.parent-first-classes";
++
++	private static final String[] PARENT_FIRST_PREFIXES = parseParentFirst(System.getProperty(
++			PARENT_FIRST_PROPERTY,
++			"org.springframework.security.authentication.UsernamePasswordAuthenticationToken,"
++					+ "org.springframework.security.core.authority.SimpleGrantedAuthority,"
++					+ "org.springframework.aop.aspectj.AbstractAspectJAdvice"));
++
+ 	private final ClassLoaderFileRepository updatedFiles;
+ 
+ 	/**
+@@ -138,11 +153,21 @@
+ 		synchronized (getClassLoadingLock(name)) {
+ 			Class<?> loadedClass = findLoadedClass(name);
+ 			if (loadedClass == null) {
+-				try {
+-					loadedClass = findClass(name);
++				if (isParentFirst(name)) {
++					try {
++						loadedClass = Class.forName(name, false, getParent());
++					}
++					catch (ClassNotFoundException ex) {
++						loadedClass = findClass(name);
++					}
+ 				}
+-				catch (ClassNotFoundException ex) {
+-					loadedClass = Class.forName(name, false, getParent());
++				else {
++					try {
++						loadedClass = findClass(name);
++					}
++					catch (ClassNotFoundException ex) {
++						loadedClass = Class.forName(name, false, getParent());
++					}
+ 				}
+ 			}
+ 			if (resolve) {
+@@ -152,6 +177,39 @@
+ 		}
+ 	}
+ 
++	/**
++	 * Parse comma-separated parent-first class names or package prefixes.
++	 * @param value configured value
++	 * @return non-null array of trimmed entries
++	 */
++	private static String[] parseParentFirst(String value) {
++		if (value == null || value.trim().isEmpty()) {
++			return new String[0];
++		}
++		String[] values = value.split(",");
++		for (int i = 0; i < values.length; i++) {
++			values[i] = values[i].trim();
++		}
++		return values;
++	}
++
++	/**
++	 * Return if the given class must be delegated to the parent class loader first.
++	 * @param name class name
++	 * @return true for an exact match or a package-prefix match ending with {@code .}
++	 */
++	private static boolean isParentFirst(String name) {
++		for (String entry : PARENT_FIRST_PREFIXES) {
++			if (entry.isEmpty()) {
++				continue;
++			}
++			if (entry.endsWith(".") ? name.startsWith(entry) : name.equals(entry)) {
++				return true;
++			}
++		}
++		return false;
++	}
++
+ 	@Override
+ 	protected Class<?> findClass(String name) throws ClassNotFoundException {
+ 		String path = name.replace('.', '/').concat(".class");

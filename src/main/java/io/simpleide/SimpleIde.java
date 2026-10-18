@@ -49,8 +49,8 @@ public final class SimpleIde {
   static final String CACHE_FORMAT_VERSION = "2";
   /** 判定 npm 编译结果时最多从日志末尾读取的字节数。 */
   static final int LOG_TAIL_LIMIT_BYTES = 256 * 1024;
-  /** 内置 Spring Boot DevTools jar（内部统一 2.7.18）。 */
-  static final String DEVTOOLS_JAR_NAME = "spring-boot-devtools-2.7.18.jar";
+  /** 内置 Spring Boot DevTools jar（2.7.18 + simple-ide parent-first 补丁）。 */
+  static final String DEVTOOLS_JAR_NAME = "spring-boot-devtools-2.7.18-simpleide.jar";
   /** 热更新触发文件与标记所在目录。 */
   static final String HOT_RELOAD_DIR = ".simple-ide/devtools";
   /** 热更新触发文件名（DevTools trigger-file 只匹配简单文件名）。 */
@@ -2503,6 +2503,19 @@ public final class SimpleIde {
             + "或通过 -Dsimple.ide.devtools.jar 指定路径");
         }
         classpath = classpath + File.pathSeparator + devtoolsJar.toAbsolutePath();
+      }
+      List<String> hotReloadIncludes = command.values("hot-reload-include");
+      if (!hotReloadIncludes.isEmpty()) {
+        Path settingsDir = project.resolve(HOT_RELOAD_DIR).resolve("spring-devtools");
+        Path metaInf = settingsDir.resolve("META-INF");
+        Files.createDirectories(metaInf);
+        StringBuilder properties = new StringBuilder();
+        for (int index = 0; index < hotReloadIncludes.size(); index++) {
+          properties.append("restart.include.").append(index).append("=")
+            .append(hotReloadIncludes.get(index)).append("\n");
+        }
+        Files.write(metaInf.resolve("spring-devtools.properties"), properties.toString().getBytes(StandardCharsets.UTF_8));
+        classpath = classpath + File.pathSeparator + settingsDir.toAbsolutePath();
       }
       ensureHotReloadTrigger(project);
       vmParams.add("-Dspring.devtools.restart.enabled=true");
@@ -5150,7 +5163,7 @@ public final class SimpleIde {
       return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  reload  对 run --hot-reload 启动的 Spring Boot 应用触发一次热更新\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  build-status  查询最近一次构建的真实阶段/耗时/日志/失败原因\n  version 打印工具版本、jps-cli 摘要与缓存格式版本\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
     if ("list".equals(command)) return "用法: simple-ide list [--project <path>] [--running-only] [--clean] [--stop-all] [--table]\n\n列出 simple-ide 启动的所有应用并集中管控（支持跨项目汇总、展示 PID/端口/状态/日志；--running-only 仅看存活应用；--stop-all 一键集中停止所有应用；--clean 清理失效状态记录；--table 以表格格式输出）。\n";
     if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--no-auto-restart] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n存在运行中的应用且检测到待编译源文件时，默认先停止应用 → 用共享输出编译 → 成功后按原参数重启（避免改动只写进隔离目录、运行时仍是旧 class）；无待编译文件则不动应用。--no-auto-restart 关闭该行为。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n";
-    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--hot-reload] [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port；两者都不指定时由 status/list 从进程监听端口自动探测实际端口。\n--hot-reload 仅支持 Spring Boot + --engine local：把内置 spring-boot-devtools-2.7.18.jar 注入应用 classpath，并启用 trigger-file 热更新；之后用 simple-ide reload 触发。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
+    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--hot-reload] [--hot-reload-include <regex>]... [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port；两者都不指定时由 status/list 从进程监听端口自动探测实际端口。\n--hot-reload 仅支持 Spring Boot + --engine local：把内置 spring-boot-devtools-2.7.18-simpleide.jar 注入应用 classpath，并启用 trigger-file 热更新；之后用 simple-ide reload 触发。\n--hot-reload-include 把匹配的依赖 jar 加入 DevTools restart classpath（可重复，值为 URL 正则）；用于应用输出目录覆盖了依赖类、且该覆盖类引用应用代码的场景。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
     if ("reload".equals(command)) return "用法: simple-ide reload --project <path> [--configuration <name>] [--timeout <sec>]\n\n对 run --hot-reload 启动的 Spring Boot 应用执行一次热更新：JPS 增量编译到共享 target/classes，然后更新 DevTools trigger 文件。\n返回 success/configuration/compiled/buildId/logFile/trigger/restartExpected；编译失败时返回 BUILD_FAILED 与结构化 build 信息，不触发重启。\n注意：该命令会直接写运行中应用的 target/classes（live write），这是 run --hot-reload 的显式取舍。\n";
     if ("debug".equals(command)) return "用法: simple-ide debug --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--vm-arg <arg>]...\n\n调试启动 Application（对齐 IDEA Debug 模式）。默认开启 JDWP 远程调试（默认端口 5005，可通过 --debug-port 自定义）。--random-port 自动选择空闲端口并传入 --server.port。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
     if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>] [--module <artifactId>] [--engine <jps|idea-mcp>] [--skip-build] [--timeout <sec>]\n\n运行单元测试。默认通过内置 JPS 增量编译并在本地 JUnit 平台执行，秒级反馈，不依赖 IDEA 运行。\n未指定 --module 时按测试源码所在模块推断作用域；多模块且无法唯一确定时显式报错。\n结果 JSON 通过真实解析判定 success，并区分 failed/skipped/aborted/notExecuted/containersFailed。\n";

@@ -25,7 +25,7 @@
 
 `run` 默认采用纯运行模式（不挂 JDWP 调试代理），类加载与 JIT 深度优化全开，启动速度完全对齐 IDEA Run；若需进行断点单步调试，使用 `debug` 命令（或 `run --debug`）启动，自动开启 JDWP 远程调试（默认端口 5005，支持 `--debug-port <port>`）。
 
-`run --hot-reload` 仅支持 Spring Boot + `--engine local`：把内置 `lib/spring-boot-devtools-2.7.18.jar` 注入应用 classpath，并设置 `spring.devtools.restart.enabled=true` 与 trigger file。随后 `simple-ide reload` 用 JPS 增量编译到共享 `target/classes`，再更新 `.simple-ide/devtools/trigger` 触发 DevTools 重启。该模式是开发期显式取舍：直接写运行中应用的 `target/classes`，且每次 reload 会重建整个 Spring 上下文（所有 Bean 重建、内存状态丢失），不是 JRebel 式按类热重载。若 classpath 存在 JRebel/HotSwapAgent，DevTools 会自动禁用重启，CLI 会直接拒绝。
+`run --hot-reload` 仅支持 Spring Boot + `--engine local`：把内置 `lib/spring-boot-devtools-2.7.18-simpleide.jar` 注入应用 classpath，并设置 `spring.devtools.restart.enabled=true` 与 trigger file。该 jar 基于上游 2.7.18，补丁为 `RestartClassLoader` 增加 parent-first 精确类列表（默认覆盖 Artemis 中 3 个纯 Spring 覆盖类），用于兼容应用输出目录覆盖依赖类的场景；若覆盖类自身引用应用代码（如 `DefaultWebResponseExceptionTranslator`），用重复的 `--hot-reload-include <url-regex>` 把对应依赖 jar 加入 restart classpath。随后 `simple-ide reload` 用 JPS 增量编译到共享 `target/classes`，再更新 `.simple-ide/devtools/trigger` 触发 DevTools 重启。该模式是开发期显式取舍：直接写运行中应用的 `target/classes`，且每次 reload 会重建整个 Spring 上下文（所有 Bean 重建、内存状态丢失），不是 JRebel 式按类热重载。若 classpath 存在 JRebel/HotSwapAgent，DevTools 会自动禁用重启，CLI 会直接拒绝。
 
 `build --auto-rebuild` 先执行增量编译，仅在诊断命中 MapStruct 读取历史匿名内部类产物、或 class 文件读取损坏等缓存特征时，自动执行一次全量重建。`build --rebuild` 则是直接清理重建，二者语义不同：显式 `--rebuild` 不会额外叠加自动重建，运行中的应用会阻止清理。若项目存在运行中的 Application，命令不会清理输出目录，而是返回 `rebuildRequired`、`rebuildReason` 和 `runningConfigurations`；应先停止对应进程后重新执行构建。单独的 Lombok `builder()` 缺失或真实源码错误不会触发重建，避免掩盖真实代码或配置问题。
 
