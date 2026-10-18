@@ -11,6 +11,8 @@ val legacyJUnitTestClasspath by configurations.creating
 
 dependencies {
   implementation(fileTree("lib") { include("*.jar") })
+  implementation("org.ow2.asm:asm:9.3")
+  implementation("org.ow2.asm:asm-tree:9.3")
   implementation("org.junit.platform:junit-platform-launcher:1.11.4")
   implementation("org.junit.jupiter:junit-jupiter-engine:5.11.4")
   implementation("org.junit.jupiter:junit-jupiter-params:5.11.4")

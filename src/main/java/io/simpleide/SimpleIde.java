@@ -972,6 +972,32 @@ public final class SimpleIde {
   }
 
   /**
+   * 对项目编译输出执行编译期调用点改写。
+   *
+   * <p>只在 SIMPLE_IDE_HOTSWAP 开启时执行；改写后的 class 会继续走 facade/版本类
+   * reload。调用点改写使已有类新增方法可以通过 Spring 自动注入的 Bean 被直接调用。
+   *
+   * @param project 项目根目录
+   * @throws java.io.IOException 改写失败
+   */
+  static void rewriteHotswapCallSites(Path project) throws java.io.IOException {
+    if (!hotswapEnabled() || project == null) {
+      return;
+    }
+    List<ModuleResolver.Module> modules = ModuleResolver.resolve(project);
+    if (modules.isEmpty()) {
+      return;
+    }
+    List<Path> outputs = new ArrayList<Path>();
+    for (ModuleResolver.Module module : modules) {
+      if (module.outputDir != null && Files.isDirectory(module.outputDir)) {
+        outputs.add(module.outputDir);
+      }
+    }
+    io.simpleide.hotswap.compile.CallSiteRewriter.rewrite(outputs);
+  }
+
+  /**
    * 判断 classpath 中是否包含文件名含指定片段的条目。
    *
    * @param classpath classpath 字符串
@@ -2496,6 +2522,9 @@ public final class SimpleIde {
       }
       ensureHotswapWorkspace(project);
     }
+    if (hotswapEnabled() && !status.isolatedBuild) {
+      rewriteHotswapCallSites(project);
+    }
     if (liveHotswap) {
       Map<String, Object> result = JsonParser.tryParseObject(status.jsonResult);
       if (result == null) {
@@ -2614,6 +2643,7 @@ public final class SimpleIde {
         System.exit(1);
         return;
       }
+      rewriteHotswapCallSites(project);
     }
 
     List<String> vmParams = split(configuration.vmParameters);
@@ -2877,6 +2907,7 @@ public final class SimpleIde {
       return;
     }
 
+    rewriteHotswapCallSites(project);
     Map<String, Object> result = submitHotswapReload(project, configName, configuration,
       reloadStarted, requestedClasses, waitTimeout);
     System.out.println(json(result));
@@ -2933,6 +2964,9 @@ public final class SimpleIde {
             continue;
           }
           String relative = output.relativize(file).toString().replace(File.separatorChar, '/');
+          if (relative.startsWith("io/simpleide/hotswap/generated/")) {
+            continue;
+          }
           Path destination = classesRoot.resolve(relative);
           Files.createDirectories(destination.getParent());
           Files.copy(file, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);

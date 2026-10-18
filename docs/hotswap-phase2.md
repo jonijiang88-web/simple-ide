@@ -161,6 +161,36 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 | JacksonPlugin | 序列化执行 | 清 Jackson 缓存 | 新 DTO 字段仍需后续适配 | 清 ObjectMapper 缓存 |
 | MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | - | mapper XML 变化自动触发对应类 reload |
 
+## 编译期调用点改写
+
+开启 `SIMPLE_IDE_HOTSWAP` 后，simple-ide 在 JPS 编译成功后会对项目输出 class 做一次编译后处理：
+
+- 扫描项目输出中的 class 集合
+- 把应用类之间的实例方法调用（`invokevirtual` / `invokeinterface`）改成生成的静态桥
+- 桥方法通过 `HotswapRuntime.invoke` 解析当前版本类
+- 为每次调用签名生成唯一桥类，避免已加载桥类无法新增方法
+
+这样即使 `UserService` 是 Spring 自动注入的 facade Bean，Controller 中重新编译的：
+
+```java
+userService.newMethod()
+```
+
+也可以调用版本类新增的方法。
+
+当前支持：
+
+- 重新编译的 Controller / Service 直接调用已有类新增方法
+- Spring CGLIB 代理：已有方法仍走代理，代理方法表没有的新方法回退到 target
+- 新 class 首次加载后使用改写后的调用点
+
+暂不支持：
+
+- 未重新编译的第三方 jar 调用点
+- 直接字段访问 `getfield` / `putfield`
+- 构造器、静态方法调用
+- 代理新增方法上的事务/缓存拦截语义
+
 ## build 自动 reload
 
 设置 `SIMPLE_IDE_HOTSWAP=1` 且存在同环境启动的运行中应用时，`simple-ide build` 会：

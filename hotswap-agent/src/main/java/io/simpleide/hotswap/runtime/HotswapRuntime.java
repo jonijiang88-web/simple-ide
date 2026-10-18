@@ -103,7 +103,26 @@ public final class HotswapRuntime implements OriginalClassStore {
    */
   public static Object invoke(Object facade, String methodName, String descriptor, Object[] args)
       throws Throwable {
-    return INSTANCE.dispatch(facade, methodName, descriptor, args);
+    if (facade == null) {
+      throw new NullPointerException("facade is null");
+    }
+    try {
+      if (!INSTANCE.isFacadeClass(facade.getClass())) {
+        // 编译期调用点改写也会覆盖接口、DTO 等未版本化对象；这类对象直接反射调用。
+        return INSTANCE.dispatcher.invoke(facade, methodName, descriptor, args);
+      }
+      return INSTANCE.dispatch(facade, methodName, descriptor, args);
+    }
+    catch (NoSuchMethodException missing) {
+      Object target = INSTANCE.resolveSpringTarget(facade);
+      if (target == null || target == facade) {
+        throw missing;
+      }
+      if (INSTANCE.isFacadeClass(target.getClass())) {
+        return INSTANCE.dispatch(target, methodName, descriptor, args);
+      }
+      return INSTANCE.dispatcher.invoke(target, methodName, descriptor, args);
+    }
   }
 
   /**
@@ -358,6 +377,39 @@ public final class HotswapRuntime implements OriginalClassStore {
   private void firePluginEvent(String className, Class<?> facadeClass, Class<?> versionClass,
                                ChangeKind kind) {
     pluginManager.fire(new HotswapReloadEvent(className, facadeClass, versionClass, kind));
+  }
+
+  /**
+   * 解析 Spring AOP 代理的目标对象，用于调用代理类上不存在的新方法。
+   *
+   * <p>已有方法仍优先走代理，保留事务/缓存等拦截器；只有代理方法表找不到目标方法时
+   * 才回退到 target。
+   *
+   * @param proxy 可能的 Spring 代理
+   * @return 目标对象；不是代理时返回 null
+   */
+  private Object resolveSpringTarget(Object proxy) {
+    if (proxy == null) {
+      return null;
+    }
+    try {
+      ClassLoader loader = proxy.getClass().getClassLoader();
+      Class<?> advisedType = Class.forName("org.springframework.aop.framework.Advised",
+        false, loader);
+      if (!advisedType.isInstance(proxy)) {
+        return null;
+      }
+      Method getTargetSource = advisedType.getMethod("getTargetSource");
+      Object targetSource = getTargetSource.invoke(proxy);
+      if (targetSource == null) {
+        return null;
+      }
+      Method getTarget = targetSource.getClass().getMethod("getTarget");
+      return getTarget.invoke(targetSource);
+    }
+    catch (Throwable ignored) {
+      return null;
+    }
   }
 
   /**
