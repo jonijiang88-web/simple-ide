@@ -112,6 +112,8 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 - `spring.tx.TransactionPlugin`：清理事务属性源和事务 advisor 缓存
 - `spring.cache.CachePlugin`：清理缓存注解元数据缓存
 - `jackson.JacksonPlugin`：清理 ObjectMapper 序列化器/反序列化器/TypeFactory 缓存
+- `hotswap-jackson-adapter`：运行在应用类加载器的 Jackson 2.13.5 effective class 适配器，
+  处理新增 DTO 字段的序列化和反序列化
 - `mybatis.MyBatisPlugin`：重解析 mapper 注解/XML，清理 MappedStatement、MapperProxy 和反射缓存
 
 公共桥接：
@@ -158,7 +160,7 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 | SpringMvcPlugin | - | 重建 RequestMapping | - | 新增/修改 URL |
 | TransactionPlugin | 事务执行 | 清属性缓存 | - | 代理重建不在范围 |
 | CachePlugin | 缓存执行 | 版本感知 CacheOperationSource | - | 不清业务缓存数据 |
-| JacksonPlugin | 序列化执行 | 清 Jackson 缓存 | 新 DTO 字段仍需后续适配 | 清 ObjectMapper 缓存 |
+| JacksonPlugin | 序列化执行 | 清 Jackson 缓存 | 新 DTO 字段由 adapter 适配 | 清 ObjectMapper 缓存 |
 | MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | - | mapper XML 变化自动触发对应类 reload |
 
 ## 编译期调用点改写
@@ -190,6 +192,23 @@ userService.newMethod()
 - 直接字段访问 `getfield` / `putfield`
 - 构造器、静态方法调用
 - 代理新增方法上的事务/缓存拦截语义
+
+### Jackson effective class adapter
+
+`hotswap-jackson-adapter` 是独立的可选 jar，由 `simple-ide run` 在 hotswap 模式加入应用 Classpath。
+它通过 Jackson 2.13.5 的 `BeanSerializerModifier` / `BeanDeserializerModifier`：
+
+- 序列化 facade DTO 时切换到当前版本对象
+- 反序列化时按版本类读取字段，再包装回 facade
+- 插件由应用类加载器首次 reload 时通过 `ServiceLoader` 加载
+
+因此新增 DTO 字段可以同时支持：
+
+```json
+{"name":"x","age":20,"email":"x@y"}
+```
+
+以及 `@RequestBody` 反向绑定。
 
 ## build 自动 reload
 

@@ -166,19 +166,19 @@ public final class CallSiteRewriter {
     ClassNode node = readClass(bytes);
     boolean changed = false;
     for (MethodNode method : node.methods) {
-      for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;
-           instruction = instruction.getNext()) {
-        if (!(instruction instanceof MethodInsnNode)) {
-          continue;
+      AbstractInsnNode instruction = method.instructions.getFirst();
+      while (instruction != null) {
+        AbstractInsnNode next = instruction.getNext();
+        if (instruction instanceof MethodInsnNode) {
+          MethodInsnNode call = (MethodInsnNode) instruction;
+          CallSpec spec = specs.get(CallSpec.key(call.owner, call.name, call.desc));
+          if (spec != null) {
+            method.instructions.set(instruction, new MethodInsnNode(Opcodes.INVOKESTATIC,
+              bridgeInternalName, spec.bridgeName, spec.bridgeDescriptor, false));
+            changed = true;
+          }
         }
-        MethodInsnNode call = (MethodInsnNode) instruction;
-        CallSpec spec = specs.get(CallSpec.key(call.owner, call.name, call.desc));
-        if (spec == null) {
-          continue;
-        }
-        method.instructions.set(instruction, new MethodInsnNode(Opcodes.INVOKESTATIC,
-          bridgeInternalName, spec.bridgeName, spec.bridgeDescriptor, false));
-        changed = true;
+        instruction = next;
       }
     }
     if (!changed) {

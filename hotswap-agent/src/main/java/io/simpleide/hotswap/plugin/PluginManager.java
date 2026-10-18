@@ -2,8 +2,11 @@ package io.simpleide.hotswap.plugin;
 
 import java.lang.instrument.Instrumentation;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.ServiceLoader;
+import java.util.Set;
 
 /**
  * 插件注册、批量缓冲与异常隔离。
@@ -12,6 +15,10 @@ public final class PluginManager {
 
   private final List<HotswapPlugin> plugins = new ArrayList<HotswapPlugin>();
   private final List<HotswapReloadEvent> pending = new ArrayList<HotswapReloadEvent>();
+  private final Set<ClassLoader> loadedLoaders =
+      Collections.newSetFromMap(new IdentityHashMap<ClassLoader, Boolean>());
+  private Instrumentation instrumentation;
+  private HotswapPluginContext pluginContext;
   private boolean batching;
 
   /**
@@ -23,7 +30,9 @@ public final class PluginManager {
     if (instrumentation == null) {
       return;
     }
+    this.instrumentation = instrumentation;
     HotswapPluginContext context = new HotswapPluginContext(instrumentation);
+    this.pluginContext = context;
     for (HotswapPlugin plugin : ServiceLoader.load(HotswapPlugin.class,
         HotswapPlugin.class.getClassLoader())) {
       register(plugin, context);
@@ -40,6 +49,29 @@ public final class PluginManager {
       catch (Throwable ignored) {
         // 应用类加载器不可见插件时保持静默，agent 插件仍可工作
       }
+    }
+  }
+
+  /**
+   * 从指定类加载器加载插件。
+   *
+   * <p>Jackson 等可选适配器 jar 只放在应用 classpath 上，premain 阶段不可见；
+   * 第一次 reload 事件使用 facade 的类加载器加载即可。
+   *
+   * @param loader 插件类加载器
+   */
+  private synchronized void loadFrom(ClassLoader loader) {
+    if (loader == null || instrumentation == null || pluginContext == null
+      || loader == HotswapPlugin.class.getClassLoader() || !loadedLoaders.add(loader)) {
+      return;
+    }
+    try {
+      for (HotswapPlugin plugin : ServiceLoader.load(HotswapPlugin.class, loader)) {
+        register(plugin, pluginContext);
+      }
+    }
+    catch (Throwable error) {
+      System.err.println("[simple-ide-hotswap] cannot load plugins from " + loader + ": " + error);
     }
   }
 
@@ -100,6 +132,7 @@ public final class PluginManager {
     if (event == null) {
       return;
     }
+    loadFrom(event.facadeClass() == null ? null : event.facadeClass().getClassLoader());
     synchronized (this) {
       if (batching) {
         pending.add(event);

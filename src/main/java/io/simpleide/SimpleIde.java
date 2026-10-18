@@ -53,8 +53,42 @@ public final class SimpleIde {
   static final String DEVTOOLS_JAR_NAME = "spring-boot-devtools-2.7.18-simpleide.jar";
   /** simple-ide 方法体热替换 agent。 */
   static final String HOTSWAP_AGENT_JAR_NAME = "simple-ide-hotswap-agent.jar";
+  static final String HOTSWAP_JACKSON_ADAPTER_JAR_NAME = "simple-ide-hotswap-jackson-adapter.jar";
   /** 热更新触发文件与标记所在目录。 */
   static final String HOT_RELOAD_DIR = ".simple-ide/devtools";
+  /**
+   * 查找可选的 Jackson effective class 适配器 jar。
+   *
+   * @return adapter jar 路径；未找到返回 null
+   */
+  static Path findHotswapJacksonAdapterJar() {
+    String override = System.getProperty("simple.ide.hotswap.jackson.adapter");
+    if (override != null && !override.trim().isEmpty()) {
+      Path path = Paths.get(override.trim()).toAbsolutePath().normalize();
+      if (Files.isRegularFile(path)) return path;
+    }
+    try {
+      URL location = SimpleIde.class.getProtectionDomain().getCodeSource().getLocation();
+      if (location != null) {
+        Path codePath = Paths.get(location.toURI());
+        Path dir = Files.isDirectory(codePath) ? codePath : codePath.getParent();
+        if (dir != null) {
+          Path candidate = dir.resolve(HOTSWAP_JACKSON_ADAPTER_JAR_NAME);
+          if (Files.isRegularFile(candidate)) return candidate;
+          Path sibling = dir.resolve("../lib/" + HOTSWAP_JACKSON_ADAPTER_JAR_NAME).normalize();
+          if (Files.isRegularFile(sibling)) return sibling;
+        }
+      }
+    }
+    catch (Exception ignored) {}
+    Path fallback = Paths.get("/home/lijiang/code/simple-ide/lib/" + HOTSWAP_JACKSON_ADAPTER_JAR_NAME);
+    if (Files.isRegularFile(fallback)) return fallback;
+    Path development = Paths.get("/home/lijiang/code/simple-ide/hotswap-jackson-adapter/build/libs/"
+      + HOTSWAP_JACKSON_ADAPTER_JAR_NAME);
+    if (Files.isRegularFile(development)) return development;
+    return null;
+  }
+
   /** 方法体热替换工作目录。 */
   static final String HOTSWAP_DIR = ".simple-ide/hotswap";
   /** 热更新触发文件名（DevTools trigger-file 只匹配简单文件名）。 */
@@ -2678,6 +2712,12 @@ public final class SimpleIde {
       System.err.println("[WARN] " + warning);
     }
     String classpath = plan.classpath;
+    if (hotswap) {
+      Path jacksonAdapter = findHotswapJacksonAdapterJar();
+      if (jacksonAdapter != null) {
+        classpath = classpath + File.pathSeparator + jacksonAdapter.toAbsolutePath();
+      }
+    }
 
     Path devtoolsJar = null;
     if (hotReload) {
