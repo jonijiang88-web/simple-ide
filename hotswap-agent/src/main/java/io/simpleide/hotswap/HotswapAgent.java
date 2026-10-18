@@ -1,5 +1,6 @@
 package io.simpleide.hotswap;
 
+import io.simpleide.hotswap.runtime.HotswapPreflight;
 import io.simpleide.hotswap.runtime.HotswapRuntime;
 import java.io.IOException;
 import java.lang.instrument.Instrumentation;
@@ -171,8 +172,11 @@ public final class HotswapAgent {
         log("request " + id + ": reloaded=" + reloaded + ", skipped=" + skipped);
       }
       catch (UnsupportedOperationException error) {
-        writeResult(id, "ERROR\nSCHEMA_CHANGE_REQUIRES_RESTART\n" + error.getMessage() + "\n");
-        log("request " + id + ": SCHEMA_CHANGE_REQUIRES_RESTART " + error);
+        String message = error.getMessage() == null ? "" : error.getMessage();
+        String preflight = HotswapPreflight.codeOf(message);
+        String code = preflight == null ? "SCHEMA_CHANGE_REQUIRES_RESTART" : preflight;
+        writeResult(id, "ERROR\n" + code + "\n" + message + "\n");
+        log("request " + id + ": " + code + " " + error);
       }
       catch (Throwable error) {
         writeResult(id, "ERROR\nHOTSWAP_FAILED\n" + error + "\n");

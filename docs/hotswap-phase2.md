@@ -61,6 +61,15 @@ reload：
 | cli | `hotswap/cli` | `.../classify/**`, `SimpleIde.java`, 对应 test | `reload --class`、schema 分类、只提交目标类 |
 | runtime | 主 agent 汇总 | `.../runtime/**`, `HotswapAgent.java` | 接线、错误码、e2e |
 
+## 不支持结构预检
+
+reload 前会检查新 class 的结构，命中以下场景时直接返回明确错误码，不进入版本化：
+
+- 声明内部类、匿名类、nest 成员或包含 `this$0` 字段：`INNER_CLASS_REQUIRES_RESTART`
+- 声明 native 方法：`NATIVE_METHOD_REQUIRES_RESTART`
+
+这类 class 在加载期不做 facade 改写，避免加载后立即出现类型或构造器不匹配。普通类的方法体变化仍走 `retransform` / `redefineClasses`。
+
 ## 约束
 
 - Java 8 兼容。

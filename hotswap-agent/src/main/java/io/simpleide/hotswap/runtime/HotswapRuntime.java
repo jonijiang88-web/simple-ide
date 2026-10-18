@@ -46,6 +46,8 @@ public final class HotswapRuntime implements OriginalClassStore {
   private static final HotswapRuntime INSTANCE = new HotswapRuntime();
 
   private final Map<String, VersionState> states = new ConcurrentHashMap<String, VersionState>();
+  private final Map<String, byte[]> unsupportedOriginalBytes =
+      new ConcurrentHashMap<String, byte[]>();
   private final Map<Object, List<Object>> versionHistory =
       Collections.synchronizedMap(new WeakHashMap<Object, List<Object>>());
   private final ClassInstrumenter instrumenter = new AsmClassInstrumenter(this);
@@ -130,11 +132,28 @@ public final class HotswapRuntime implements OriginalClassStore {
     }
     VersionState state = stateOf(original);
     if (state == null || state.original == null) {
+      String unsupported = HotswapPreflight.check(newBytes);
+      if (unsupported != null) {
+        byte[] previous = unsupportedOriginalBytes.get(className);
+        if (previous != null && classifier.classify(previous, newBytes) == ChangeKind.METHOD_BODY) {
+          instrumentation.redefineClasses(new ClassDefinition(original, newBytes));
+          return;
+        }
+        throw new UnsupportedOperationException(unsupported
+          + ": class versioning cannot safely reload this class; restart the application");
+      }
       instrumentation.redefineClasses(new ClassDefinition(original, newBytes));
       return;
     }
     synchronized (monitor) {
       ChangeKind kind = classifier.classify(state.currentBytes, newBytes);
+      if (kind != ChangeKind.METHOD_BODY) {
+        String unsupported = HotswapPreflight.check(newBytes);
+        if (unsupported != null) {
+          throw new UnsupportedOperationException(unsupported
+            + ": class versioning cannot safely reload this class; restart the application");
+        }
+      }
       if (kind == ChangeKind.HIERARCHY || kind == ChangeKind.UNSUPPORTED) {
         throw new UnsupportedOperationException("class change is not hot-reloadable: " + kind);
       }
@@ -489,6 +508,11 @@ public final class HotswapRuntime implements OriginalClassStore {
         return null;
       }
       if (!shouldInstrument(className, protectionDomain)) {
+        return null;
+      }
+      String unsupported = HotswapPreflight.check(classfileBuffer);
+      if (unsupported != null) {
+        unsupportedOriginalBytes.put(className.replace('/', '.'), classfileBuffer.clone());
         return null;
       }
       try {
