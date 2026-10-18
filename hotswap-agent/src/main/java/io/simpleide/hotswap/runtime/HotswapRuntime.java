@@ -663,7 +663,11 @@ public final class HotswapRuntime implements OriginalClassStore {
     String dotted = className.replace('/', '.');
     if (dotted.startsWith("java.") || dotted.startsWith("javax.") || dotted.startsWith("sun.")
         || dotted.startsWith("jdk.") || dotted.startsWith("io.simpleide.hotswap.")
-        || dotted.contains(HotswapNames.VERSION_PREFIX)) {
+        || dotted.contains(HotswapNames.VERSION_PREFIX)
+        || dotted.contains("$$EnhancerBySpringCGLIB$$")
+        || dotted.contains("$$FastClassBySpringCGLIB$$")
+        || dotted.contains("$$SpringCGLIB$$")
+        || dotted.startsWith("$Proxy")) {
       return false;
     }
     if (!includePrefix.isEmpty() && !dotted.startsWith(includePrefix)) {

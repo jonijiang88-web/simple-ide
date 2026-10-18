@@ -84,7 +84,8 @@ public final class AsmClassInstrumenter implements ClassInstrumenter {
     ClassNode node = readClass(reader, className);
     String dottedName = (className == null || className.isEmpty())
       ? node.name.replace('/', '.') : className;
-    if (isExcluded(node.name) || isSkippedType(node.access) || hasDelegateField(node)) {
+    if (isExcluded(node.name) || isSkippedType(node.access) || hasDelegateField(node)
+      || isSpringConfiguration(node)) {
       return originalBytes;
     }
     node.fields.add(createDelegateField());
@@ -164,6 +165,28 @@ public final class AsmClassInstrumenter implements ClassInstrumenter {
     String dottedName = internalName.replace('/', '.');
     for (String prefix : EXCLUDED_PREFIXES) {
       if (dottedName.startsWith(prefix)) {
+        return true;
+      }
+    }
+    return dottedName.contains("$$EnhancerBySpringCGLIB$$")
+      || dottedName.contains("$$FastClassBySpringCGLIB$$")
+      || dottedName.contains("$$SpringCGLIB$$")
+      || dottedName.startsWith("$Proxy");
+  }
+
+  /**
+   * 判断是否是 Spring 配置类，避免改写 CGLIB 配置代理的父类方法导致递归。
+   *
+   * @param node class 树
+   * @return Spring 配置类返回 true
+   */
+  private static boolean isSpringConfiguration(ClassNode node) {
+    if (node.visibleAnnotations == null) {
+      return false;
+    }
+    for (org.objectweb.asm.tree.AnnotationNode annotation : node.visibleAnnotations) {
+      if ("Lorg/springframework/context/annotation/Configuration;".equals(annotation.desc)
+        || "Lorg/springframework/boot/autoconfigure/SpringBootApplication;".equals(annotation.desc)) {
         return true;
       }
     }

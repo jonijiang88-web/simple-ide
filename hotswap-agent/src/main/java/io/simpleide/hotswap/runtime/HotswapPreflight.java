@@ -33,11 +33,12 @@ public final class HotswapPreflight {
     if (classBytes == null || classBytes.length == 0) {
       return null;
     }
-    ClassNode node = new ClassNode();
+    ClassNode node;
     try {
+      node = new ClassNode();
       new ClassReader(classBytes).accept(node, ClassReader.SKIP_CODE);
     }
-    catch (RuntimeException ignored) {
+    catch (Throwable ignored) {
       return null;
     }
     for (FieldNode field : node.fields) {

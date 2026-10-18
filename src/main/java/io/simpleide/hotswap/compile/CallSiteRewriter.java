@@ -39,6 +39,9 @@ public final class CallSiteRewriter {
   /** 生成桥类的内部名前缀。 */
   private static final String BRIDGE_PREFIX = "io/simpleide/hotswap/generated/CallBridge";
 
+  /** 单个桥类最多包含的方法数，避免大型项目触达 Class too large。 */
+  private static final int MAX_METHODS_PER_BRIDGE = 200;
+
   /** HotswapRuntime 内部名。 */
   private static final String RUNTIME_INTERNAL_NAME = "io/simpleide/hotswap/runtime/HotswapRuntime";
 
@@ -105,24 +108,33 @@ public final class CallSiteRewriter {
     if (ordered.isEmpty()) {
       return;
     }
-    Map<String, CallSpec> byKey = new HashMap<String, CallSpec>();
-    for (CallSpec spec : ordered) {
-      byKey.put(spec.key(), spec);
+    Map<String, BridgeCall> byKey = new HashMap<String, BridgeCall>();
+    List<BridgeClass> bridgeClasses = new ArrayList<BridgeClass>();
+    for (int start = 0; start < ordered.size(); start += MAX_METHODS_PER_BRIDGE) {
+      int end = Math.min(start + MAX_METHODS_PER_BRIDGE, ordered.size());
+      List<CallSpec> chunk = ordered.subList(start, end);
+      String bridgeInternalName = bridgeInternalName(chunk);
+      bridgeClasses.add(new BridgeClass(bridgeInternalName, chunk));
+      for (CallSpec spec : chunk) {
+        byKey.put(spec.key(), new BridgeCall(bridgeInternalName, spec.bridgeName,
+          spec.bridgeDescriptor));
+      }
     }
-    String bridgeInternalName = bridgeInternalName(ordered);
     for (Map.Entry<Path, byte[]> entry : classBytes.entrySet()) {
-      byte[] rewritten = rewriteClass(entry.getValue(), byKey, bridgeInternalName);
+      byte[] rewritten = rewriteClass(entry.getValue(), byKey);
       if (rewritten != entry.getValue()) {
         writeAtomically(entry.getKey(), rewritten);
       }
     }
-    byte[] bridge = generateBridge(ordered, bridgeInternalName);
-    for (Path output : outputs) {
-      Path bridgeFile = output.resolve(bridgeInternalName.concat(".class"));
-      if (!Files.isDirectory(bridgeFile.getParent())) {
-        Files.createDirectories(bridgeFile.getParent());
+    for (BridgeClass bridgeClass : bridgeClasses) {
+      byte[] bridge = generateBridge(bridgeClass.specs, bridgeClass.internalName);
+      for (Path output : outputs) {
+        Path bridgeFile = output.resolve(bridgeClass.internalName.concat(".class"));
+        if (!Files.isDirectory(bridgeFile.getParent())) {
+          Files.createDirectories(bridgeFile.getParent());
+        }
+        writeAtomically(bridgeFile, bridge);
       }
-      writeAtomically(bridgeFile, bridge);
     }
   }
 
@@ -161,8 +173,7 @@ public final class CallSiteRewriter {
    * @param specs 调用点索引
    * @return 改写后的字节；没有变化时返回原数组
    */
-  private static byte[] rewriteClass(byte[] bytes, Map<String, CallSpec> specs,
-                                     String bridgeInternalName) {
+  private static byte[] rewriteClass(byte[] bytes, Map<String, BridgeCall> specs) {
     ClassNode node = readClass(bytes);
     boolean changed = false;
     for (MethodNode method : node.methods) {
@@ -171,10 +182,10 @@ public final class CallSiteRewriter {
         AbstractInsnNode next = instruction.getNext();
         if (instruction instanceof MethodInsnNode) {
           MethodInsnNode call = (MethodInsnNode) instruction;
-          CallSpec spec = specs.get(CallSpec.key(call.owner, call.name, call.desc));
+          BridgeCall spec = specs.get(CallSpec.key(call.owner, call.name, call.desc));
           if (spec != null) {
             method.instructions.set(instruction, new MethodInsnNode(Opcodes.INVOKESTATIC,
-              bridgeInternalName, spec.bridgeName, spec.bridgeDescriptor, false));
+              spec.bridgeInternalName, spec.bridgeName, spec.bridgeDescriptor, false));
             changed = true;
           }
         }
@@ -459,6 +470,45 @@ public final class CallSiteRewriter {
     Files.write(temporary, bytes);
     Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING,
       StandardCopyOption.ATOMIC_MOVE);
+  }
+
+  /** 一个桥目标和原始调用签名。 */
+  private static final class BridgeCall {
+
+    private final String bridgeInternalName;
+    private final String bridgeName;
+    private final String bridgeDescriptor;
+
+    /**
+     * 创建桥调用信息。
+     *
+     * @param bridgeInternalName 桥类内部名
+     * @param bridgeName 桥方法名
+     * @param bridgeDescriptor 桥方法描述符
+     */
+    private BridgeCall(String bridgeInternalName, String bridgeName, String bridgeDescriptor) {
+      this.bridgeInternalName = bridgeInternalName;
+      this.bridgeName = bridgeName;
+      this.bridgeDescriptor = bridgeDescriptor;
+    }
+  }
+
+  /** 一组待生成桥方法。 */
+  private static final class BridgeClass {
+
+    private final String internalName;
+    private final List<CallSpec> specs;
+
+    /**
+     * 创建桥类描述。
+     *
+     * @param internalName 内部名
+     * @param specs 桥方法
+     */
+    private BridgeClass(String internalName, List<CallSpec> specs) {
+      this.internalName = internalName;
+      this.specs = specs;
+    }
   }
 
   /** 调用点规格。 */

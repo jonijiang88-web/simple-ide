@@ -1040,6 +1040,19 @@ public final class SimpleIde {
   }
 
   /**
+   * 是否启用编译期调用点改写。
+   *
+   * <p>调用点改写会为应用类之间的实例调用生成桥类，适合需要直接调用新增方法的场景；
+   * 大型工程或存在旧 ASM/特殊代理时可显式关闭，仅保留 facade/版本类热替换。
+   *
+   * @return 启用返回 true
+   */
+  static boolean hotswapCallSitesEnabled() {
+    return truthyEnv("SIMPLE_IDE_HOTSWAP_CALLSITES")
+      || Boolean.parseBoolean(System.getProperty("simple.ide.hotswap.callsites", "false"));
+  }
+
+  /**
    * 对项目编译输出执行编译期调用点改写。
    *
    * <p>只在 SIMPLE_IDE_HOTSWAP 开启时执行；改写后的 class 会继续走 facade/版本类
@@ -1049,7 +1062,7 @@ public final class SimpleIde {
    * @throws java.io.IOException 改写失败
    */
   static void rewriteHotswapCallSites(Path project) throws java.io.IOException {
-    if (!hotswapEnabled() || project == null) {
+    if (!hotswapEnabled() || project == null || !hotswapCallSitesEnabled()) {
       return;
     }
     List<ModuleResolver.Module> modules = ModuleResolver.resolve(project);
@@ -2735,6 +2748,13 @@ public final class SimpleIde {
         agentArguments += ",include=" + hotswapInclude;
       }
       vmParams.add("-javaagent:" + hotswapAgent.toAbsolutePath() + "=" + agentArguments);
+      Path asmJar = hotswapAgent.toAbsolutePath().getParent().resolve("asm-9.3.jar");
+      Path asmTreeJar = hotswapAgent.toAbsolutePath().getParent().resolve("asm-tree-9.3.jar");
+      if (Files.isRegularFile(asmJar) && Files.isRegularFile(asmTreeJar)) {
+        // Artemis 等工程的应用 Classpath 自带旧版 ASM；把 agent 使用的 ASM 放到
+        // bootclasspath，避免 ClassNode 被旧 ASM 以不支持 API 版本拒绝。
+        vmParams.add("-Xbootclasspath/a:" + asmJar + File.pathSeparator + asmTreeJar);
+      }
     }
     int debugPort = resolveDebugPort(command, vmParams);
     Path runDirectory = project.resolve(".simple-ide/runs");
