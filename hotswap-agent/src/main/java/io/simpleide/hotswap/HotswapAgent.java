@@ -1,9 +1,8 @@
 package io.simpleide.hotswap;
 
+import io.simpleide.hotswap.runtime.HotswapRuntime;
 import java.io.IOException;
-import java.lang.instrument.ClassDefinition;
 import java.lang.instrument.Instrumentation;
-import java.lang.instrument.UnmodifiableClassException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -26,8 +25,8 @@ import java.util.List;
  * results/&lt;id&gt;.txt    OK / ERROR:code / message
  * </pre>
  *
- * <p>Only method-body changes are supported by the JVM's redefinition API. Schema
- * changes fail with a clear error and must fall back to a restart.
+ * <p>Facade classes are versioned by {@link HotswapRuntime}; classes that were not
+ * instrumented fall back to the JVM's redefineClasses API.
  */
 public final class HotswapAgent {
 
@@ -48,18 +47,40 @@ public final class HotswapAgent {
 
   private static void start(String agentArgs, Instrumentation instrumentation) {
     Path directory = parseDirectory(agentArgs);
+    String include = parseOption(agentArgs, "include", "");
     try {
       Files.createDirectories(directory.resolve("requests"));
       Files.createDirectories(directory.resolve("classes"));
       Files.createDirectories(directory.resolve("results"));
-      log(directory, "agent started: " + directory.toAbsolutePath());
+      log(directory, "agent started: " + directory.toAbsolutePath() + ", include=" + include);
     }
     catch (IOException error) {
       throw new IllegalStateException("Cannot initialize hotswap directory: " + directory, error);
     }
+    HotswapRuntime.getInstance().configure(instrumentation, directory, include);
     Thread worker = new Thread(new Worker(directory, instrumentation), "simple-ide-hotswap");
     worker.setDaemon(true);
     worker.start();
+  }
+
+  /**
+   * 解析 agent 参数。
+   *
+   * @param agentArgs agent 参数
+   * @param key 参数键
+   * @param fallback 默认值
+   * @return 参数值
+   */
+  private static String parseOption(String agentArgs, String key, String fallback) {
+    String value = agentArgs == null ? "" : agentArgs.trim();
+    String prefix = key + "=";
+    for (String part : value.split(",")) {
+      String entry = part.trim();
+      if (entry.startsWith(prefix)) {
+        return entry.substring(prefix.length());
+      }
+    }
+    return fallback;
   }
 
   private static Path parseDirectory(String agentArgs) {
@@ -123,8 +144,8 @@ public final class HotswapAgent {
       String id = request.getFileName().toString();
       id = id.substring(0, id.length() - ".req".length());
       List<String> classPaths = Files.readAllLines(request, StandardCharsets.UTF_8);
-      List<ClassDefinition> definitions = new ArrayList<ClassDefinition>();
       List<String> skipped = new ArrayList<String>();
+      int reloaded = 0;
       try {
         for (String line : classPaths) {
           String relative = line.trim();
@@ -142,30 +163,20 @@ public final class HotswapAgent {
             skipped.add(className);
             continue;
           }
-          definitions.add(new ClassDefinition(target, Files.readAllBytes(classFile)));
+          HotswapRuntime.getInstance().reload(className, Files.readAllBytes(classFile));
+          reloaded++;
         }
-        if (definitions.isEmpty()) {
-          writeResult(id, "OK\n" + "redefined=0\n" + "skipped=" + skipped.size() + "\n");
-          log("request " + id + ": no loaded classes to redefine, skipped=" + skipped);
-        }
-        else {
-          instrumentation.redefineClasses(definitions.toArray(new ClassDefinition[0]));
-          writeResult(id, "OK\n" + "redefined=" + definitions.size() + "\n"
-            + "skipped=" + skipped.size() + "\n");
-          log("request " + id + ": redefined=" + definitions.size() + ", skipped=" + skipped);
-        }
-      }
-      catch (UnmodifiableClassException error) {
-        writeResult(id, "ERROR\nUNMODIFIABLE\n" + error.getMessage() + "\n");
-        log("request " + id + ": UNMODIFIABLE " + error);
+        writeResult(id, "OK\n" + "reloaded=" + reloaded + "\n"
+          + "skipped=" + skipped.size() + "\n");
+        log("request " + id + ": reloaded=" + reloaded + ", skipped=" + skipped);
       }
       catch (UnsupportedOperationException error) {
         writeResult(id, "ERROR\nSCHEMA_CHANGE_REQUIRES_RESTART\n" + error.getMessage() + "\n");
         log("request " + id + ": SCHEMA_CHANGE_REQUIRES_RESTART " + error);
       }
       catch (Throwable error) {
-        writeResult(id, "ERROR\nREDEFINE_FAILED\n" + error + "\n");
-        log("request " + id + ": REDEFINE_FAILED " + error);
+        writeResult(id, "ERROR\nHOTSWAP_FAILED\n" + error + "\n");
+        log("request " + id + ": HOTSWAP_FAILED " + error);
       }
       finally {
         Files.deleteIfExists(request);

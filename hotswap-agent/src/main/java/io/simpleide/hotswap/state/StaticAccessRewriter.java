@@ -63,6 +63,32 @@ public final class StaticAccessRewriter {
    * @throws Exception 字节码解析或生成失败时抛出
    */
   public byte[] rewrite(byte[] classBytes, String stateClassName) throws Exception {
+    return rewrite(classBytes, stateClassName, true);
+  }
+
+  /**
+   * 改写版本类字节码：跳过 {@code <clinit>}，避免新版本初始化时重置共享静态值。
+   *
+   * @param classBytes 版本类字节
+   * @param stateClassName 共享 key 使用的点分类名
+   * @return 改写后的字节
+   * @throws Exception 字节码解析或生成失败时抛出
+   */
+  public byte[] rewriteVersion(byte[] classBytes, String stateClassName) throws Exception {
+    return rewrite(classBytes, stateClassName, false);
+  }
+
+  /**
+   * 改写字节码，可控制是否改写 {@code <clinit>}。
+   *
+   * @param classBytes 原始类或版本类字节
+   * @param stateClassName 共享 key 使用的点号类名；为 null 时使用字节中的类名
+   * @param rewriteInitializer 是否改写静态初始化块
+   * @return 改写后的类字节
+   * @throws Exception 字节码解析或生成失败时抛出
+   */
+  private byte[] rewrite(byte[] classBytes, String stateClassName, boolean rewriteInitializer)
+      throws Exception {
     if (classBytes == null) {
       throw new IllegalArgumentException("Cannot rewrite static access: class bytes are null");
     }
@@ -75,6 +101,9 @@ public final class StaticAccessRewriter {
       return classBytes;
     }
     for (MethodNode method : node.methods) {
+      if (!rewriteInitializer && "<clinit>".equals(method.name)) {
+        continue;
+      }
       rewriteMethod(method, node.name, keyOwner, sharedFields);
     }
     ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);

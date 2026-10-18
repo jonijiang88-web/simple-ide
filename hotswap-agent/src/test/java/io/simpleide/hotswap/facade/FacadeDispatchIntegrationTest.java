@@ -209,6 +209,31 @@ class FacadeDispatchIntegrationTest {
     }
 
     /**
+     * 优先加载内存中的替身类（尤其 HotswapRuntime），避免父加载器中的真实运行时抢先命中。
+     *
+     * @param name 点分类名
+     * @param resolve 是否解析
+     * @return 类对象
+     * @throws ClassNotFoundException 字节映射和父加载器都不存在该类时抛出
+     */
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+      synchronized (getClassLoadingLock(name)) {
+        Class<?> loaded = findLoadedClass(name);
+        if (loaded == null && definitions.containsKey(name)) {
+          loaded = findClass(name);
+        }
+        if (loaded == null) {
+          loaded = super.loadClass(name, false);
+        }
+        if (resolve) {
+          resolveClass(loaded);
+        }
+        return loaded;
+      }
+    }
+
+    /**
      * 从内存字节定义尚未被父加载器加载的类。
      *
      * @param name 点分类名
