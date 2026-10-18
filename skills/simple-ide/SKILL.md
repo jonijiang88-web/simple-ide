@@ -65,7 +65,7 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 - 预检/重启边界：类含内部类、匿名类、nest 成员、`this$0`、native 方法时不做 facade，schema/signature 变更返回 `INNER_CLASS_REQUIRES_RESTART` 或 `NATIVE_METHOD_REQUIRES_RESTART`。父类/接口变化、枚举、类修饰符变化、`@Configuration`/`@Bean` 增删、`@ControllerAdvice` 结构变化、Mapper 接口新增方法、Spring 代理方法新增的事务/缓存语义、直接字段访问、静态方法体和构造器改写仍可能不支持或需要重启。Spring `@Configuration`、CGLIB 代理类会被排除在 facade 改写之外，避免配置类递归。
 - 应用自带旧 ASM 时，simple-ide 会把 agent 使用的 ASM 9.3 放入 bootclasspath，避免 `ClassNode.<init>` 等解析被旧 ASM 拒绝；这是兼容措施，不是业务依赖。
 - `SIMPLE_IDE_HOTSWAP=1 simple-ide build` 在存在同模式运行中应用时，会 live-write `target/classes`，自动把本轮变更 class/资源提交给 agent，输出 `hotswapReload`（单配置）或 `hotswapReloads`；`--configuration <name>` 限定配置。构建失败/不支持结构时检查 `errorCode`，不要把 `success:true` 当作所有结构都可热更。
-- 耗时统计：`build` JSON 的 `durationMs` 是编译耗时；应用启动耗时看日志中的 `Started ... in` 或从 `run` 到 `status` 就绪的墙钟时间；`hotswapReload` 的 `redefined`/`classes` 和 build 整体 `durationMs` 共同反映热更耗时。不要把全量启动耗时和增量 reload 耗时混在一起。
+- 耗时统计：`build` JSON 的 `durationMs` 是编译耗时；应用启动耗时看日志中的 `Started ... in` 或从 `run` 到 `status` 就绪的墙钟时间；`hotswapReload` 的 `redefined`/`classes` 和 build 整体 `durationMs` 共同反映热更耗时。不要把全量启动耗时和增量 reload 耗时混在一起。全量启动基线至少记录：clean build 墙钟/`durationMs`、`Started Application in`、首次业务健康检查耗时；每个 hotswap 场景记录 build 墙钟、`durationMs`、`hotswapReload.redefined` 和接口响应。
 - 内部类/新增方法/反射等能力随版本演进；使用前先跑一个项目 smoke：已有方法体、新增字段、新增 Controller 方法、DTO 字段、Mapper SQL、Mapper DTO 字段各验证一次。
 
 - `run` 默认本地进程**纯运行模式**（不挂 JDWP 调试代理），类加载与 JIT C2 优化全开，获得对齐 IDEA Run 的极致启动速度；`--engine idea-mcp` 才请求 IDEA 托管。
