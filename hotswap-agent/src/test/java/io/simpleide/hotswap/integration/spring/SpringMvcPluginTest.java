@@ -26,17 +26,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class SpringMvcPluginTest {
 
-  /** 只有注解变更与方法签名变更需要重建请求映射。 */
+  /** 注解、方法签名和字段/方法结构变更都可能改变请求映射。 */
   @Test
-  void refreshesOnlyAnnotationAndSignatureChanges() {
+  void refreshesStructuralChanges() {
     // 验证：注解变更触发 MVC 刷新
     assertTrue(SpringMvcPlugin.supports(ChangeKind.ANNOTATION));
     // 验证：方法签名变更触发 MVC 刷新
     assertTrue(SpringMvcPlugin.supports(ChangeKind.SIGNATURE));
     // 验证：方法体变更不重建映射
     assertFalse(SpringMvcPlugin.supports(ChangeKind.METHOD_BODY));
-    // 验证：schema 变更不重建映射
-    assertFalse(SpringMvcPlugin.supports(ChangeKind.SCHEMA));
+    // 验证：字段与方法同时变化时仍需重建映射
+    assertTrue(SpringMvcPlugin.supports(ChangeKind.SCHEMA));
     // 验证：变更类型缺失时不刷新
     assertFalse(SpringMvcPlugin.supports(null));
   }

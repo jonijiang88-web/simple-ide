@@ -82,7 +82,8 @@ public final class SpringMvcPlugin implements HotswapPlugin {
    * @return 需要刷新返回 true
    */
   static boolean supports(ChangeKind kind) {
-    return kind == ChangeKind.ANNOTATION || kind == ChangeKind.SIGNATURE;
+    return kind == ChangeKind.ANNOTATION || kind == ChangeKind.SIGNATURE
+      || kind == ChangeKind.SCHEMA;
   }
 
   /**
