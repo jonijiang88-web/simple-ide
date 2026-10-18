@@ -183,7 +183,6 @@ public final class HotswapAgent {
       catch (Throwable error) {
         writeResult(id, "ERROR\nHOTSWAP_FAILED\n" + error + "\n");
         log("request " + id + ": HOTSWAP_FAILED " + error);
-        error.printStackTrace();
       }
       finally {
         runtime.endBatch();

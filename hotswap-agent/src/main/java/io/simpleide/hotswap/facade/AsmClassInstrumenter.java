@@ -47,7 +47,11 @@ public final class AsmClassInstrumenter implements ClassInstrumenter {
   private static final String RUNTIME_INTERNAL_NAME = HotswapNames.RUNTIME_CLASS.replace('.', '/');
 
   /** 不参与改写的类名前缀：JDK 自身与 agent 实现。 */
-  private static final String[] EXCLUDED_PREFIXES = {"java.", "io.simpleide.hotswap."};
+  private static final String[] EXCLUDED_PREFIXES = {
+      "java.", "javax.", "sun.", "jdk.", "io.simpleide.hotswap.",
+      "org.springframework.", "com.baomidou.", "com.cloudhelios.",
+      "com.alibaba.", "org.apache.", "org.mybatis.", "com.fasterxml."
+  };
 
   private final OriginalClassStore originalClassStore;
 
@@ -171,7 +175,8 @@ public final class AsmClassInstrumenter implements ClassInstrumenter {
     return dottedName.contains("$$EnhancerBySpringCGLIB$$")
       || dottedName.contains("$$FastClassBySpringCGLIB$$")
       || dottedName.contains("$$SpringCGLIB$$")
-      || dottedName.startsWith("$Proxy");
+      || dottedName.startsWith("$Proxy")
+      || dottedName.contains("$");
   }
 
   /**
@@ -186,7 +191,8 @@ public final class AsmClassInstrumenter implements ClassInstrumenter {
     }
     for (org.objectweb.asm.tree.AnnotationNode annotation : node.visibleAnnotations) {
       if ("Lorg/springframework/context/annotation/Configuration;".equals(annotation.desc)
-        || "Lorg/springframework/boot/autoconfigure/SpringBootApplication;".equals(annotation.desc)) {
+        || "Lorg/springframework/boot/autoconfigure/SpringBootApplication;".equals(annotation.desc)
+        || "Lorg/springframework/boot/context/properties/ConfigurationProperties;".equals(annotation.desc)) {
         return true;
       }
     }
@@ -226,7 +232,7 @@ public final class AsmClassInstrumenter implements ClassInstrumenter {
    */
   private static FieldNode createDelegateField() {
     return new FieldNode(
-      Opcodes.ACC_PRIVATE | Opcodes.ACC_VOLATILE,
+      Opcodes.ACC_PRIVATE | Opcodes.ACC_VOLATILE | Opcodes.ACC_TRANSIENT,
       HotswapNames.DELEGATE_FIELD,
       DELEGATE_DESCRIPTOR,
       null,

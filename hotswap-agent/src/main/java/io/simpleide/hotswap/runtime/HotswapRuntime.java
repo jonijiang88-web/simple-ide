@@ -663,6 +663,11 @@ public final class HotswapRuntime implements OriginalClassStore {
     String dotted = className.replace('/', '.');
     if (dotted.startsWith("java.") || dotted.startsWith("javax.") || dotted.startsWith("sun.")
         || dotted.startsWith("jdk.") || dotted.startsWith("io.simpleide.hotswap.")
+        || dotted.startsWith("org.springframework.") || dotted.startsWith("com.baomidou.")
+        || dotted.startsWith("com.cloudhelios.") || dotted.startsWith("com.alibaba.")
+        || dotted.startsWith("org.apache.") || dotted.startsWith("org.mybatis.")
+        || dotted.startsWith("com.fasterxml.")
+        || dotted.contains("$")
         || dotted.contains(HotswapNames.VERSION_PREFIX)
         || dotted.contains("$$EnhancerBySpringCGLIB$$")
         || dotted.contains("$$FastClassBySpringCGLIB$$")
@@ -703,7 +708,7 @@ public final class HotswapRuntime implements OriginalClassStore {
       try {
         String dotted = className.replace('/', '.');
         byte[] facade = instrumenter.instrument(classfileBuffer, dotted, loader);
-        return staticRewriter.rewrite(facade, dotted);
+        return staticRewriter.rewriteFacade(facade, dotted);
       }
       catch (Throwable error) {
         System.err.println("[simple-ide-hotswap] cannot instrument " + className + ": " + error);

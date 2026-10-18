@@ -60,7 +60,7 @@ class AsmClassInstrumenterTest {
 
     // 验证：delegate 字段存在且为 private volatile Object
     FieldNode delegate = field(facadeNode, HotswapNames.DELEGATE_FIELD);
-    assertEquals(Opcodes.ACC_PRIVATE | Opcodes.ACC_VOLATILE, delegate.access);
+    assertEquals(Opcodes.ACC_PRIVATE | Opcodes.ACC_VOLATILE | Opcodes.ACC_TRANSIENT, delegate.access);
     assertEquals("Ljava/lang/Object;", delegate.desc);
 
     // 验证：父类保持 java/lang/Object

@@ -55,6 +55,18 @@ public final class StaticAccessRewriter {
   }
 
   /**
+   * 改写 facade 类字节：不处理静态方法/静态初始化块，避免静态字段在 capture 前被读取。
+   *
+   * @param classBytes 原始类字节
+   * @param stateClassName 共享 key 使用的点分类名
+   * @return 改写后的字节
+   * @throws Exception 字节码解析或生成失败时抛出
+   */
+  public byte[] rewriteFacade(byte[] classBytes, String stateClassName) throws Exception {
+    return rewrite(classBytes, stateClassName, true, true);
+  }
+
+  /**
    * 改写字节码，并指定共享静态字段使用的 key 前缀。
    *
    * @param classBytes 原始类或版本类字节
@@ -63,7 +75,7 @@ public final class StaticAccessRewriter {
    * @throws Exception 字节码解析或生成失败时抛出
    */
   public byte[] rewrite(byte[] classBytes, String stateClassName) throws Exception {
-    return rewrite(classBytes, stateClassName, true);
+    return rewrite(classBytes, stateClassName, true, false);
   }
 
   /**
@@ -75,7 +87,7 @@ public final class StaticAccessRewriter {
    * @throws Exception 字节码解析或生成失败时抛出
    */
   public byte[] rewriteVersion(byte[] classBytes, String stateClassName) throws Exception {
-    return rewrite(classBytes, stateClassName, false);
+    return rewrite(classBytes, stateClassName, false, false);
   }
 
   /**
@@ -87,8 +99,8 @@ public final class StaticAccessRewriter {
    * @return 改写后的类字节
    * @throws Exception 字节码解析或生成失败时抛出
    */
-  private byte[] rewrite(byte[] classBytes, String stateClassName, boolean rewriteInitializer)
-      throws Exception {
+  private byte[] rewrite(byte[] classBytes, String stateClassName, boolean rewriteInitializer,
+                         boolean skipStaticMethods) throws Exception {
     if (classBytes == null) {
       throw new IllegalArgumentException("Cannot rewrite static access: class bytes are null");
     }
@@ -102,6 +114,11 @@ public final class StaticAccessRewriter {
     }
     for (MethodNode method : node.methods) {
       if (!rewriteInitializer && "<clinit>".equals(method.name)) {
+        continue;
+      }
+      // 静态方法和静态初始化块可能在 capture 之前执行；保持原始静态字段访问，
+      // 避免启动期出现 “Static field was not captured”。静态方法体本身不支持热替换。
+      if (skipStaticMethods && (method.access & Opcodes.ACC_STATIC) != 0) {
         continue;
       }
       rewriteMethod(method, node.name, keyOwner, sharedFields);
