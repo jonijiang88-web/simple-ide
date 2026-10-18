@@ -45,8 +45,7 @@ public final class HotswapRuntime implements OriginalClassStore {
 
   private static final HotswapRuntime INSTANCE = new HotswapRuntime();
 
-  private final Map<String, VersionState> states =
-      Collections.synchronizedMap(new WeakHashMap<String, VersionState>());
+  private final Map<String, VersionState> states = new ConcurrentHashMap<String, VersionState>();
   private final Map<Object, List<Object>> versionHistory =
       Collections.synchronizedMap(new WeakHashMap<Object, List<Object>>());
   private final ClassInstrumenter instrumenter = new AsmClassInstrumenter(this);
