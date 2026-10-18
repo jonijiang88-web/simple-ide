@@ -54,6 +54,7 @@ public final class SimpleIde {
   /** simple-ide 方法体热替换 agent。 */
   static final String HOTSWAP_AGENT_JAR_NAME = "simple-ide-hotswap-agent.jar";
   static final String HOTSWAP_JACKSON_ADAPTER_JAR_NAME = "simple-ide-hotswap-jackson-adapter.jar";
+  static final String HOTSWAP_MYBATIS_ADAPTER_JAR_NAME = "simple-ide-hotswap-mybatis-adapter.jar";
   /** 热更新触发文件与标记所在目录。 */
   static final String HOT_RELOAD_DIR = ".simple-ide/devtools";
   /**
@@ -85,6 +86,39 @@ public final class SimpleIde {
     if (Files.isRegularFile(fallback)) return fallback;
     Path development = Paths.get("/home/lijiang/code/simple-ide/hotswap-jackson-adapter/build/libs/"
       + HOTSWAP_JACKSON_ADAPTER_JAR_NAME);
+    if (Files.isRegularFile(development)) return development;
+    return null;
+  }
+
+  /**
+   * 查找可选的 MyBatis effective class 适配器 jar。
+   *
+   * @return adapter jar 路径；未找到返回 null
+   */
+  static Path findHotswapMybatisAdapterJar() {
+    String override = System.getProperty("simple.ide.hotswap.mybatis.adapter");
+    if (override != null && !override.trim().isEmpty()) {
+      Path path = Paths.get(override.trim()).toAbsolutePath().normalize();
+      if (Files.isRegularFile(path)) return path;
+    }
+    try {
+      URL location = SimpleIde.class.getProtectionDomain().getCodeSource().getLocation();
+      if (location != null) {
+        Path codePath = Paths.get(location.toURI());
+        Path dir = Files.isDirectory(codePath) ? codePath : codePath.getParent();
+        if (dir != null) {
+          Path candidate = dir.resolve(HOTSWAP_MYBATIS_ADAPTER_JAR_NAME);
+          if (Files.isRegularFile(candidate)) return candidate;
+          Path sibling = dir.resolve("../lib/" + HOTSWAP_MYBATIS_ADAPTER_JAR_NAME).normalize();
+          if (Files.isRegularFile(sibling)) return sibling;
+        }
+      }
+    }
+    catch (Exception ignored) {}
+    Path fallback = Paths.get("/home/lijiang/code/simple-ide/lib/" + HOTSWAP_MYBATIS_ADAPTER_JAR_NAME);
+    if (Files.isRegularFile(fallback)) return fallback;
+    Path development = Paths.get("/home/lijiang/code/simple-ide/hotswap-mybatis-adapter/build/libs/"
+      + HOTSWAP_MYBATIS_ADAPTER_JAR_NAME);
     if (Files.isRegularFile(development)) return development;
     return null;
   }
@@ -2716,6 +2750,10 @@ public final class SimpleIde {
       Path jacksonAdapter = findHotswapJacksonAdapterJar();
       if (jacksonAdapter != null) {
         classpath = classpath + File.pathSeparator + jacksonAdapter.toAbsolutePath();
+      }
+      Path mybatisAdapter = findHotswapMybatisAdapterJar();
+      if (mybatisAdapter != null) {
+        classpath = classpath + File.pathSeparator + mybatisAdapter.toAbsolutePath();
       }
     }
 

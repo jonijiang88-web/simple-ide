@@ -115,6 +115,8 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 - `hotswap-jackson-adapter`：运行在应用类加载器的 Jackson 2.13.5 effective class 适配器，
   处理新增 DTO 字段的序列化和反序列化
 - `mybatis.MyBatisPlugin`：重解析 mapper 注解/XML，清理 MappedStatement、MapperProxy 和反射缓存
+- `hotswap-mybatis-adapter`：运行在应用类加载器的 MyBatis 3.5.13 effective class 适配器，
+  让 ResultMap 自动映射和属性写入使用版本 DTO
 
 公共桥接：
 
@@ -161,7 +163,7 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 | TransactionPlugin | 事务执行 | 清属性缓存 | - | 代理重建不在范围 |
 | CachePlugin | 缓存执行 | 版本感知 CacheOperationSource | - | 不清业务缓存数据 |
 | JacksonPlugin | 序列化执行 | 清 Jackson 缓存 | 新 DTO 字段由 adapter 适配 | 清 ObjectMapper 缓存 |
-| MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | - | mapper XML 变化自动触发对应类 reload |
+| MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | 新 DTO 字段由 adapter 适配 | mapper XML 变化自动触发对应类 reload |
 
 ## 编译期调用点改写
 
@@ -209,6 +211,24 @@ userService.newMethod()
 ```
 
 以及 `@RequestBody` 反向绑定。
+
+### MyBatis effective class adapter
+
+`hotswap-mybatis-adapter` 由 `simple-ide run` 在 hotswap 模式加入应用 Classpath。
+它在 MyBatis `Configuration` 上安装版本感知 `ObjectWrapperFactory`：
+
+- ResultSet 仍按 facade 类型创建结果对象
+- ObjectWrapper 读写转发到当前版本对象
+- 新 DTO 字段可以由 MyBatis ResultMap/自动映射填充
+- 返回给调用方仍是 facade DTO
+
+已验证：新增 DTO 字段后，MyBatis 查询结果可以自动填充新字段。
+
+限制：
+
+- Mapper 接口新增方法仍受 JVM 限制，需要重启
+- 显式 ResultMap 中 Facade 上完全不存在的新属性依赖 MyBatis 自动映射或属性适配
+- 自定义 ObjectWrapperFactory 会在安装时被替换
 
 ## build 自动 reload
 

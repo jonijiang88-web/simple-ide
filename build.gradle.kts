@@ -47,6 +47,9 @@ distributions {
       from(project(":hotswap-jackson-adapter").layout.buildDirectory.file("libs/simple-ide-hotswap-jackson-adapter.jar")) {
         into("lib")
       }
+      from(project(":hotswap-mybatis-adapter").layout.buildDirectory.file("libs/simple-ide-hotswap-mybatis-adapter.jar")) {
+        into("lib")
+      }
       filesMatching("bin/*") {
         permissions {
           unix("rwxr-xr-x")
@@ -61,9 +64,9 @@ distributions {
   }
 }
 
-tasks.named("installDist") { dependsOn(":hotswap-agent:jar", ":hotswap-jackson-adapter:jar") }
-tasks.named("distZip") { dependsOn(":hotswap-agent:jar", ":hotswap-jackson-adapter:jar") }
-tasks.named("distTar") { dependsOn(":hotswap-agent:jar", ":hotswap-jackson-adapter:jar") }
+tasks.named("installDist") { dependsOn(":hotswap-agent:jar", ":hotswap-jackson-adapter:jar", ":hotswap-mybatis-adapter:jar") }
+tasks.named("distZip") { dependsOn(":hotswap-agent:jar", ":hotswap-jackson-adapter:jar", ":hotswap-mybatis-adapter:jar") }
+tasks.named("distTar") { dependsOn(":hotswap-agent:jar", ":hotswap-jackson-adapter:jar", ":hotswap-mybatis-adapter:jar") }
 
 tasks.test {
   systemProperty("simple.ide.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
