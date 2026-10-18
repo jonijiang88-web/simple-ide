@@ -215,7 +215,7 @@ public final class MyBatisPlugin implements HotswapPlugin {
     removeNamespaceKeys(configuration, FIELD_RESULT_MAPS, namespace);
     removeNamespaceKeys(configuration, FIELD_SQL_FRAGMENTS, namespace);
     Map<?, ?> caches = mapField(configuration, FIELD_CACHES);
-    if (caches != null) {
+    if (caches != null && caches.containsKey(namespace)) {
       Object cache = caches.get(namespace);
       if (cache != null) {
         clearCache(cache);

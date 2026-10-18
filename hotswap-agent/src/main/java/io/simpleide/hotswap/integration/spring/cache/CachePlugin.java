@@ -1,10 +1,13 @@
 package io.simpleide.hotswap.integration.spring.cache;
 
 import io.simpleide.hotswap.integration.spring.SpringContextBridge;
+import io.simpleide.hotswap.runtime.HotswapRuntime;
 import io.simpleide.hotswap.plugin.HotswapPlugin;
 import io.simpleide.hotswap.plugin.HotswapReloadEvent;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -114,6 +117,9 @@ public final class CachePlugin implements HotswapPlugin {
       }
       for (Object bean : beansOfType(beanFactory, type)) {
         try {
+          if (CACHE_INTERCEPTOR.equals(type.getName())) {
+            installVersionAwareSource(bean, loader);
+          }
           clearOperationSource(bean, visited);
         }
         catch (Throwable error) {
@@ -121,6 +127,143 @@ public final class CachePlugin implements HotswapPlugin {
             + bean.getClass().getName() + ": " + describe(error));
         }
       }
+    }
+  }
+
+  /**
+   * 为 CacheInterceptor 安装版本感知的 CacheOperationSource 包装器。
+   *
+   * <p>CacheInterceptor 创建时缓存了 facade 方法上的注解；版本类新增或修改
+   * {@code @Cacheable} 等注解后，直接把 facade 方法交给 Spring 仍然读到旧注解。
+   * 包装器在查询缓存操作时把 facade 方法映射到当前版本类方法。
+   *
+   * @param interceptor CacheInterceptor
+   * @param loader 应用类加载器
+   * @throws Exception 反射失败
+   */
+  private static void installVersionAwareSource(Object interceptor, ClassLoader loader)
+      throws Exception {
+    Field field = findField(interceptor.getClass(), OPERATION_SOURCE_FIELD);
+    if (field == null) {
+      return;
+    }
+    field.setAccessible(true);
+    Object source = field.get(interceptor);
+    if (source == null || Proxy.isProxyClass(source.getClass())) {
+      return;
+    }
+    Class<?> sourceType = loadClass(CACHE_OPERATION_SOURCE, loader);
+    if (sourceType == null || !sourceType.isInstance(source)) {
+      return;
+    }
+    Object wrapped = Proxy.newProxyInstance(loader, new Class<?>[]{sourceType},
+      new VersionAwareCacheOperationHandler(source));
+    field.set(interceptor, wrapped);
+    try {
+      invokeNoArg(interceptor, "clearMetadataCache");
+    }
+    catch (Throwable ignored) {
+      // 老版本没有该方法时仅依赖属性缓存清理
+    }
+  }
+
+  /**
+   * 版本感知缓存操作源处理器。
+   */
+  private static final class VersionAwareCacheOperationHandler implements InvocationHandler {
+
+    private final Object delegate;
+
+    /**
+     * 创建处理器。
+     *
+     * @param delegate 原 CacheOperationSource
+     */
+    private VersionAwareCacheOperationHandler(Object delegate) {
+      this.delegate = delegate;
+    }
+
+    /**
+     * 把 facade 方法/类型映射到版本类后委托原操作源。
+     *
+     * @param proxy 代理对象
+     * @param method 被调方法
+     * @param args 参数
+     * @return 结果
+     * @throws Throwable 委托异常
+     */
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      Object[] actual = args == null ? new Object[0] : args;
+      if ("getCacheOperations".equals(method.getName()) && actual.length == 2
+        && actual[0] instanceof Method && actual[1] instanceof Class) {
+        Method original = (Method) actual[0];
+        Class<?> targetClass = (Class<?>) actual[1];
+        Class<?> effectiveClass = effectiveClass(targetClass);
+        Method effectiveMethod = findCompatibleMethod(effectiveClass, original);
+        return invokeDelegate(method, new Object[]{effectiveMethod, effectiveClass});
+      }
+      return invokeDelegate(method, actual);
+    }
+
+    /**
+     * 调用原操作源。
+     *
+     * @param method 接口方法
+     * @param args 参数
+     * @return 结果
+     * @throws Throwable 委托异常
+     */
+    private Object invokeDelegate(Method method, Object[] args) throws Throwable {
+      try {
+        return method.invoke(delegate, args);
+      }
+      catch (InvocationTargetException error) {
+        Throwable cause = error.getCause();
+        throw cause == null ? error : cause;
+      }
+    }
+
+    /**
+     * 解析 facade 对应的当前版本类。
+     *
+     * @param targetClass 原类型
+     * @return 当前版本类或原类型
+     */
+    private Class<?> effectiveClass(Class<?> targetClass) {
+      Class<?> effective = HotswapRuntime.effectiveClass(targetClass);
+      if (effective != null && effective != targetClass) {
+        return effective;
+      }
+      for (Class<?> current = targetClass; current != null; current = current.getSuperclass()) {
+        effective = HotswapRuntime.effectiveClass(current);
+        if (effective != null && effective != current) {
+          return effective;
+        }
+      }
+      return targetClass;
+    }
+
+    /**
+     * 在目标类型中查找同名同参数方法。
+     *
+     * @param type 目标类型
+     * @param source 原方法
+     * @return 方法；找不到返回原方法
+     */
+    private Method findCompatibleMethod(Class<?> type, Method source) {
+      for (Class<?> current = type; current != null && current != Object.class;
+           current = current.getSuperclass()) {
+        try {
+          Method candidate = current.getDeclaredMethod(source.getName(), source.getParameterTypes());
+          candidate.setAccessible(true);
+          return candidate;
+        }
+        catch (NoSuchMethodException ignored) {
+          // 继续父类
+        }
+      }
+      return source;
     }
   }
 

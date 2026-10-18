@@ -103,15 +103,21 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 
 ## Phase 2 Spring 插件
 
-`io.simpleide.hotswap.integration.spring`：
+固定运行环境：Spring Boot 2.7.18 / Spring Framework 5.3.31。
+
+`io.simpleide.hotswap.integration` 下的独立插件：
+
+- `spring.SpringBootPlugin`：捕获 ApplicationContext，清理 Spring 注解/内省缓存，补注入版本对象字段
+- `spring.SpringMvcPlugin`：重建 Controller 的 `RequestMappingHandlerMapping`，清理异常处理缓存
+- `spring.tx.TransactionPlugin`：清理事务属性源和事务 advisor 缓存
+- `spring.cache.CachePlugin`：清理缓存注解元数据缓存
+- `jackson.JacksonPlugin`：清理 ObjectMapper 序列化器/反序列化器/TypeFactory 缓存
+- `mybatis.MyBatisPlugin`：重解析 mapper 注解/XML，清理 MappedStatement、MapperProxy 和反射缓存
+
+公共桥接：
 
 - `SpringContextTransformer`：在 `SpringApplication.run(...)` 返回路径捕获 `ApplicationContext`
 - `SpringContextBridge`：agent 与 Spring 类之间的无 Spring 编译依赖桥
-- `SpringPlugin`：
-  - 清理 Spring 注解/内省缓存
-  - 对 schema/signature 变更的 bean 版本对象执行按类型注入
-  - 对 annotation/signature 变更的 Controller，重建 `RequestMappingHandlerMapping` 中的映射
-  - 清理 `ExceptionHandlerExceptionResolver` 的 advice 缓存
 
 支持范围：
 
@@ -126,6 +132,31 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 - `@Configuration` / `@Bean` 增删
 - `@Transactional` / `@Cacheable` 等代理注解变化
 - Jackson / MyBatis 元数据（Phase 3/4）
+
+## 固定版本
+
+插件按以下版本实现和验证：
+
+| 组件 | 版本 |
+|---|---|
+| Spring Boot | 2.7.18 |
+| Spring Framework | 5.3.31 |
+| Jackson | 2.13.5 |
+| MyBatis | 3.5.13 |
+| mybatis-spring-boot-starter | 2.3.1 |
+
+插件仍通过反射访问框架 API；固定版本保证内部字段/方法名有明确依据。
+
+### 插件能力矩阵
+
+| 插件 | 方法体 | 注解/映射 | 字段结构 | 说明 |
+|---|---|---|---|---|
+| SpringBootPlugin | 缓存刷新 | - | 版本对象补注入 | 捕获 ApplicationContext |
+| SpringMvcPlugin | - | 重建 RequestMapping | - | 新增/修改 URL |
+| TransactionPlugin | 事务执行 | 清属性缓存 | - | 代理重建不在范围 |
+| CachePlugin | 缓存执行 | 版本感知 CacheOperationSource | - | 不清业务缓存数据 |
+| JacksonPlugin | 序列化执行 | 清 Jackson 缓存 | 新 DTO 字段仍需后续适配 | 清 ObjectMapper 缓存 |
+| MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | - | XML 变化需触发 mapper reload |
 
 ## build 自动 reload
 

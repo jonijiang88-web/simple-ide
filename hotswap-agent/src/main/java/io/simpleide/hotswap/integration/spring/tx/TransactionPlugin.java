@@ -1,11 +1,15 @@
 package io.simpleide.hotswap.integration.spring.tx;
 
 import io.simpleide.hotswap.integration.spring.SpringContextBridge;
+import io.simpleide.hotswap.runtime.HotswapRuntime;
 import io.simpleide.hotswap.plugin.HotswapPlugin;
 import io.simpleide.hotswap.plugin.HotswapPluginContext;
 import io.simpleide.hotswap.plugin.HotswapReloadEvent;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -186,10 +190,148 @@ public final class TransactionPlugin implements HotswapPlugin {
     if (root == null) {
       return;
     }
+    installVersionAwareSource(root);
     Set<Object> visited =
         Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
     clearAttributeCaches(root, visited);
     clearAopCaches(root);
+  }
+
+  /**
+   * 为 TransactionInterceptor 安装版本感知的事务属性源。
+   *
+   * <p>Spring 代理拦截的是 facade 方法；直接把 facade 方法交给事务属性源会读到旧
+   * {@code @Transactional} 注解。包装器在解析属性时把方法映射到当前版本类。
+   *
+   * @param root 事务 bean
+   */
+  private static void installVersionAwareSource(Object root) {
+    if (root == null || !TRANSACTION_INTERCEPTOR.equals(root.getClass().getName())
+      && !matchesTypeName(root.getClass(), Collections.singleton(TRANSACTION_INTERCEPTOR))) {
+      return;
+    }
+    Field field = findField(root.getClass(), TRANSACTION_ATTRIBUTE_SOURCE_FIELD);
+    if (field == null) {
+      return;
+    }
+    try {
+      field.setAccessible(true);
+      Object source = field.get(root);
+      if (source == null || Proxy.isProxyClass(source.getClass())) {
+        return;
+      }
+      ClassLoader loader = root.getClass().getClassLoader();
+      Class<?> sourceType = Class.forName(TRANSACTION_ATTRIBUTE_SOURCE, false, loader);
+      if (sourceType == null || !sourceType.isInstance(source)) {
+        return;
+      }
+      Object wrapped = Proxy.newProxyInstance(loader, new Class<?>[]{sourceType},
+        new VersionAwareTransactionSource(source));
+      field.set(root, wrapped);
+    }
+    catch (Throwable error) {
+      report("transactionAttributeSource", error);
+    }
+  }
+
+  /**
+   * 版本感知事务属性源代理。
+   */
+  private static final class VersionAwareTransactionSource implements InvocationHandler {
+
+    private final Object delegate;
+
+    /**
+     * 创建代理。
+     *
+     * @param delegate 原属性源
+     */
+    private VersionAwareTransactionSource(Object delegate) {
+      this.delegate = delegate;
+    }
+
+    /**
+     * 映射方法后委托。
+     *
+     * @param proxy 代理
+     * @param method 接口方法
+     * @param args 参数
+     * @return 结果
+     * @throws Throwable 委托异常
+     */
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      Object[] actual = args == null ? new Object[0] : args;
+      if ("getTransactionAttribute".equals(method.getName()) && actual.length == 2
+        && actual[0] instanceof Method && actual[1] instanceof Class) {
+        Method original = (Method) actual[0];
+        Class<?> targetClass = (Class<?>) actual[1];
+        Class<?> effectiveClass = effectiveClass(targetClass);
+        Method effectiveMethod = findCompatibleMethod(effectiveClass, original);
+        return invokeDelegate(method, new Object[]{effectiveMethod, effectiveClass});
+      }
+      return invokeDelegate(method, actual);
+    }
+
+    /**
+     * 调用原属性源。
+     *
+     * @param method 接口方法
+     * @param args 参数
+     * @return 结果
+     * @throws Throwable 委托异常
+     */
+    private Object invokeDelegate(Method method, Object[] args) throws Throwable {
+      try {
+        return method.invoke(delegate, args);
+      }
+      catch (InvocationTargetException error) {
+        Throwable cause = error.getCause();
+        throw cause == null ? error : cause;
+      }
+    }
+
+    /**
+     * 解析当前版本类。
+     *
+     * @param targetClass 原类型
+     * @return 版本类或原类型
+     */
+    private Class<?> effectiveClass(Class<?> targetClass) {
+      Class<?> effective = HotswapRuntime.effectiveClass(targetClass);
+      if (effective != null && effective != targetClass) {
+        return effective;
+      }
+      for (Class<?> current = targetClass; current != null; current = current.getSuperclass()) {
+        effective = HotswapRuntime.effectiveClass(current);
+        if (effective != null && effective != current) {
+          return effective;
+        }
+      }
+      return targetClass;
+    }
+
+    /**
+     * 查找同名同参数方法。
+     *
+     * @param type 类型
+     * @param source 原方法
+     * @return 方法或原方法
+     */
+    private Method findCompatibleMethod(Class<?> type, Method source) {
+      for (Class<?> current = type; current != null && current != Object.class;
+           current = current.getSuperclass()) {
+        try {
+          Method candidate = current.getDeclaredMethod(source.getName(), source.getParameterTypes());
+          candidate.setAccessible(true);
+          return candidate;
+        }
+        catch (NoSuchMethodException ignored) {
+          // 继续父类
+        }
+      }
+      return source;
+    }
   }
 
   /**
