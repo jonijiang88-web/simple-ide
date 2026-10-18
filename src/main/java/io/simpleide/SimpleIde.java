@@ -51,8 +51,12 @@ public final class SimpleIde {
   static final int LOG_TAIL_LIMIT_BYTES = 256 * 1024;
   /** 内置 Spring Boot DevTools jar（2.7.18 + simple-ide parent-first 补丁）。 */
   static final String DEVTOOLS_JAR_NAME = "spring-boot-devtools-2.7.18-simpleide.jar";
+  /** simple-ide 方法体热替换 agent。 */
+  static final String HOTSWAP_AGENT_JAR_NAME = "simple-ide-hotswap-agent.jar";
   /** 热更新触发文件与标记所在目录。 */
   static final String HOT_RELOAD_DIR = ".simple-ide/devtools";
+  /** 方法体热替换工作目录。 */
+  static final String HOTSWAP_DIR = ".simple-ide/hotswap";
   /** 热更新触发文件名（DevTools trigger-file 只匹配简单文件名）。 */
   static final String HOT_RELOAD_TRIGGER_NAME = "trigger";
   /** 等待 IDEA 启动的最大秒数。 */
@@ -901,6 +905,70 @@ public final class SimpleIde {
     Path fallback = Paths.get("/home/lijiang/code/simple-ide/lib/" + DEVTOOLS_JAR_NAME);
     if (Files.isRegularFile(fallback)) return fallback;
     return null;
+  }
+
+  /** 是否启用 simple-ide 内置方法体热替换（环境变量 SIMPLE_IDE_HOTSWAP）。 */
+  static boolean hotswapEnabled() {
+    return truthyEnv("SIMPLE_IDE_HOTSWAP") || Boolean.parseBoolean(System.getProperty("simple.ide.hotswap", "false"));
+  }
+
+  /**
+   * 查找 simple-ide 方法体热替换 agent jar。
+   *
+   * @return agent jar 绝对路径；未找到时返回 null
+   */
+  static Path findHotswapAgentJar() {
+    String override = System.getProperty("simple.ide.hotswap.agent");
+    if (override != null && !override.trim().isEmpty()) {
+      Path path = Paths.get(override.trim()).toAbsolutePath().normalize();
+      if (Files.isRegularFile(path)) return path;
+    }
+    try {
+      URL location = SimpleIde.class.getProtectionDomain().getCodeSource().getLocation();
+      if (location != null) {
+        Path codePath = Paths.get(location.toURI());
+        Path dir = Files.isDirectory(codePath) ? codePath : codePath.getParent();
+        if (dir != null) {
+          Path candidate = dir.resolve(HOTSWAP_AGENT_JAR_NAME);
+          if (Files.isRegularFile(candidate)) return candidate;
+          Path sibling = dir.resolve("../lib/" + HOTSWAP_AGENT_JAR_NAME).normalize();
+          if (Files.isRegularFile(sibling)) return sibling;
+        }
+      }
+    }
+    catch (Exception ignored) {}
+    Path fallback = Paths.get("/home/lijiang/code/simple-ide/lib/" + HOTSWAP_AGENT_JAR_NAME);
+    if (Files.isRegularFile(fallback)) return fallback;
+    Path development = Paths.get("/home/lijiang/code/simple-ide/hotswap-agent/build/libs/" + HOTSWAP_AGENT_JAR_NAME);
+    if (Files.isRegularFile(development)) return development;
+    return null;
+  }
+
+  /** 方法体热替换工作目录。 */
+  static Path hotswapDirectory(Path project) {
+    return project.resolve(HOTSWAP_DIR);
+  }
+
+  /** 方法体热替换运行标记。 */
+  static Path hotswapMarker(Path project, String configuration) {
+    return hotswapDirectory(project).resolve("enabled-" + configuration + ".json");
+  }
+
+  /**
+   * 创建工作目录并写入 build 阶段标记，供 reload 判断构建链路已启用。
+   *
+   * @param project 项目根目录
+   * @throws java.io.IOException 创建失败
+   */
+  static void ensureHotswapWorkspace(Path project) throws java.io.IOException {
+    Path directory = hotswapDirectory(project);
+    Files.createDirectories(directory.resolve("requests"));
+    Files.createDirectories(directory.resolve("classes"));
+    Files.createDirectories(directory.resolve("results"));
+    if (!Files.exists(directory.resolve("build.json"))) {
+      Files.write(directory.resolve("build.json"),
+        json(mapOf("enabled", true, "createdAt", System.currentTimeMillis())).getBytes(StandardCharsets.UTF_8));
+    }
   }
 
   /**
@@ -2390,6 +2458,13 @@ public final class SimpleIde {
       // 编译失败必须以非零退出码结束，否则调用方仅凭退出码会把失败误判为成功
       System.exit(1);
     }
+    if (hotswapEnabled()) {
+      if (findHotswapAgentJar() == null) {
+        throw new IllegalStateException("SIMPLE_IDE_HOTSWAP 已启用，但未找到 " + HOTSWAP_AGENT_JAR_NAME
+          + "；请确认 lib 目录包含该 jar");
+      }
+      ensureHotswapWorkspace(project);
+    }
   }
 
   /** 启动 Application：默认纯运行模式（不开启 JDWP 调试代理，对齐 IDEA Run 极致性能）；指定 debug 命令或 --debug 时开启远程调试；支持 --random-port / --port 动态覆盖。 */
@@ -2399,9 +2474,15 @@ public final class SimpleIde {
     int port = configuredPort(command);
     String engine = command.option("engine", "local");
     boolean hotReload = command.flag("hot-reload");
+    boolean hotswap = hotswapEnabled();
 
+    if (hotswap && hotReload) {
+      throw new IllegalArgumentException("SIMPLE_IDE_HOTSWAP 与 --hot-reload 不能同时启用：前者是方法体原地替换，后者是 DevTools 全量 context 重启");
+    }
+    if (hotswap && "idea-mcp".equalsIgnoreCase(engine)) {
+      throw new IllegalArgumentException("SIMPLE_IDE_HOTSWAP 仅支持 --engine local（agent 必须注入本地进程）");
+    }
     if ("idea-mcp".equalsIgnoreCase(engine)) {
-      if (hotReload) throw new IllegalArgumentException("--hot-reload 仅支持 --engine local（DevTools 必须注入本地进程 classpath）");
       if (runViaMcp(project, configName, port, command)) return;
     }
 
@@ -2475,6 +2556,17 @@ public final class SimpleIde {
     List<String> extraVmArgs = command.values("vm-arg");
     if (extraVmArgs != null && !extraVmArgs.isEmpty()) {
       vmParams.addAll(extraVmArgs);
+    }
+    Path hotswapAgent = null;
+    if (hotswap) {
+      hotswapAgent = findHotswapAgentJar();
+      if (hotswapAgent == null) {
+        throw new IllegalStateException("未找到 " + HOTSWAP_AGENT_JAR_NAME
+          + "；请确认 lib 目录包含该 jar，或通过 -Dsimple.ide.hotswap.agent 指定路径");
+      }
+      ensureHotswapWorkspace(project);
+      vmParams.add("-javaagent:" + hotswapAgent.toAbsolutePath() + "=dir="
+        + hotswapDirectory(project).toAbsolutePath());
     }
     int debugPort = resolveDebugPort(command, vmParams);
     Path runDirectory = project.resolve(".simple-ide/runs");
@@ -2556,11 +2648,30 @@ public final class SimpleIde {
     else {
       Files.deleteIfExists(marker);
     }
+    Path hotswapMarker = hotswapMarker(project, configuration.name);
+    if (hotswap) {
+      Map<String, Object> markerData = mapOf(
+        "configuration", configuration.name,
+        "module", configuration.module,
+        "agent", hotswapAgent != null ? hotswapAgent.toAbsolutePath().toString() : "",
+        "directory", hotswapDirectory(project).toAbsolutePath().toString(),
+        "startedAt", System.currentTimeMillis());
+      Files.createDirectories(hotswapMarker.getParent());
+      Files.write(hotswapMarker, json(markerData).getBytes(StandardCharsets.UTF_8));
+    }
+    else {
+      Files.deleteIfExists(hotswapMarker);
+    }
     Map<String, Object> result = state.toMap(port > 0 ? "STARTING" : "RUNNING");
     if (hotReload) {
       result.put("hotReload", true);
       result.put("trigger", hotReloadTrigger(project).toAbsolutePath().toString());
       if (devtoolsJar != null) result.put("devtoolsJar", devtoolsJar.toAbsolutePath().toString());
+    }
+    if (hotswap) {
+      result.put("hotswap", true);
+      result.put("hotswapAgent", hotswapAgent.toAbsolutePath().toString());
+      result.put("hotswapDir", hotswapDirectory(project).toAbsolutePath().toString());
     }
     System.out.println(json(result));
   }
@@ -2577,6 +2688,10 @@ public final class SimpleIde {
   private static void reload(Command command) throws Exception {
     Path project = command.project();
     String configName = command.option("configuration", "Application");
+    if (hotswapEnabled()) {
+      hotswapReload(command);
+      return;
+    }
     ApplicationConfiguration configuration = ApplicationConfiguration.load(project, configName);
     RunState state = RunState.read(runState(project, configName));
     if (state == null || !isProcessAlive(state.pid)) {
@@ -2635,6 +2750,154 @@ public final class SimpleIde {
       "trigger", trigger.toAbsolutePath().toString(),
       "restartExpected", true,
       "note", "DevTools 轮询触发文件（默认 1s + 400ms quiet period）后重启 context；可用 logs 查看结果")));
+  }
+
+  /**
+   * 方法体热替换：JPS 增量编译到共享 target/classes，把变更 class 交给 agent 执行
+   * {@code redefineClasses}，不重启 Spring context。
+   *
+   * @param command 命令参数
+   * @throws Exception 读取配置、构建或与 agent 通信失败
+   */
+  private static void hotswapReload(Command command) throws Exception {
+    Path project = command.project();
+    String configName = command.option("configuration", "Application");
+    ApplicationConfiguration configuration = ApplicationConfiguration.load(project, configName);
+    RunState state = RunState.read(runState(project, configName));
+    if (state == null || !isProcessAlive(state.pid)) {
+      System.out.println(json(mapOf("success", false, "configuration", configName,
+        "errorCode", "NOT_RUNNING", "error", "Application 未运行：" + configName)));
+      System.exit(1);
+      return;
+    }
+    Path marker = hotswapMarker(project, configName);
+    if (!Files.isRegularFile(marker)) {
+      System.out.println(json(mapOf("success", false, "configuration", configName,
+        "errorCode", "HOTSWAP_NOT_ENABLED",
+        "error", "应用不是通过 SIMPLE_IDE_HOTSWAP 启动的；请停止后设置环境变量重新 run")));
+      System.exit(1);
+      return;
+    }
+    ensureHotswapWorkspace(project);
+    List<String> modules = new ArrayList<String>();
+    if (configuration.module != null && !configuration.module.trim().isEmpty()) {
+      modules.add(configuration.module);
+    }
+    int buildTimeout = Integer.parseInt(command.option("build-timeout", "600"));
+    int waitTimeout = Integer.parseInt(command.option("timeout", "30"));
+    long reloadStarted = System.currentTimeMillis();
+    BuildTracker tracker = BuildTracker.start(project, "jps", modules, buildTimeout, false);
+    tracker.startHeartbeat(System.err);
+    BuildStatus status;
+    try {
+      try (BuildLock ignored = BuildLock.acquire(project)) {
+        status = buildViaJps(project, modules, null, buildTimeout, false, false, false, false, false, true, tracker, null);
+      }
+    }
+    finally {
+      tracker.close();
+    }
+    if (status == null || !status.success) {
+      Map<String, Object> build = status == null ? null : JsonParser.tryParseObject(status.jsonResult);
+      System.out.println(json(mapOf("success", false, "configuration", configName,
+        "errorCode", "BUILD_FAILED", "build", build != null ? build : status == null ? "NO_ENGINE" : status.jsonResult,
+        "buildId", tracker.buildId(), "logFile", tracker.logFile().toAbsolutePath().toString())));
+      System.exit(1);
+      return;
+    }
+
+    Path classesRoot = hotswapDirectory(project).resolve("classes");
+    List<String> relativePaths = new ArrayList<String>();
+    List<ModuleResolver.Module> resolved = ModuleResolver.resolve(project);
+    ModuleResolver.Module target = resolved.isEmpty() ? null : ModuleResolver.select(resolved, configuration.module);
+    List<ModuleResolver.Module> closure = target == null ? resolved : ModuleResolver.closure(resolved, target);
+    for (ModuleResolver.Module module : closure) {
+      Path output = module.outputDir;
+      if (!Files.isDirectory(output)) {
+        continue;
+      }
+      try (java.util.stream.Stream<Path> stream = Files.walk(output)) {
+        java.util.Iterator<Path> iterator = stream.iterator();
+        while (iterator.hasNext()) {
+          Path file = iterator.next();
+          String name = file.getFileName().toString();
+          if (!Files.isRegularFile(file) || !name.endsWith(".class")) {
+            continue;
+          }
+          if (Files.getLastModifiedTime(file).toMillis() < reloadStarted - 2000L) {
+            continue;
+          }
+          String relative = output.relativize(file).toString().replace(File.separatorChar, '/');
+          Path destination = classesRoot.resolve(relative);
+          Files.createDirectories(destination.getParent());
+          Files.copy(file, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+          relativePaths.add(relative);
+        }
+      }
+    }
+    if (relativePaths.isEmpty()) {
+      System.out.println(json(mapOf("success", true, "configuration", configName,
+        "compiled", true, "redefined", 0, "note", "没有发现需要热替换的 class")));
+      return;
+    }
+    String id = "reload-" + System.currentTimeMillis();
+    Path request = hotswapDirectory(project).resolve("requests").resolve(id + ".req");
+    Files.write(request, relativePaths, StandardCharsets.UTF_8);
+    Path result = hotswapDirectory(project).resolve("results").resolve(id + ".txt");
+    long deadline = System.currentTimeMillis() + waitTimeout * 1000L;
+    while (System.currentTimeMillis() < deadline) {
+      if (Files.isRegularFile(result)) {
+        List<String> lines = Files.readAllLines(result, StandardCharsets.UTF_8);
+        String statusLine = lines.isEmpty() ? "" : lines.get(0).trim();
+        if ("OK".equals(statusLine)) {
+          Map<String, Object> response = mapOf("success", true, "configuration", configName,
+            "compiled", true, "redefined", parseCount(lines, "redefined="),
+            "skipped", parseCount(lines, "skipped="), "classes", relativePaths,
+            "agentLog", tail(hotswapDirectory(project).resolve("agent.log"), 20));
+          Files.deleteIfExists(result);
+          System.out.println(json(response));
+          return;
+        }
+        String code = lines.size() > 1 ? lines.get(1).trim() : "REDEFINE_FAILED";
+        String message = lines.size() > 2 ? lines.get(2).trim() : "热替换失败";
+        Map<String, Object> failure = mapOf("success", false, "configuration", configName,
+          "errorCode", code, "error", message, "classes", relativePaths,
+          "agentLog", tail(hotswapDirectory(project).resolve("agent.log"), 20));
+        Files.deleteIfExists(result);
+        System.out.println(json(failure));
+        System.exit(1);
+        return;
+      }
+      if (!isProcessAlive(state.pid)) {
+        System.out.println(json(mapOf("success", false, "configuration", configName,
+          "errorCode", "APP_EXITED", "error", "应用进程已退出，无法完成热替换")));
+        System.exit(1);
+        return;
+      }
+      Thread.sleep(200L);
+    }
+    System.out.println(json(mapOf("success", false, "configuration", configName,
+      "errorCode", "HOTSWAP_AGENT_TIMEOUT",
+      "error", "等待 hotswap agent 结果超时（" + waitTimeout + "s）",
+      "classes", relativePaths,
+      "agentLog", tail(hotswapDirectory(project).resolve("agent.log"), 20))));
+    System.exit(1);
+  }
+
+  /** 读取 agent 结果中的计数行。 */
+  private static int parseCount(List<String> lines, String prefix) {
+    for (String line : lines) {
+      String trimmed = line.trim();
+      if (trimmed.startsWith(prefix)) {
+        try {
+          return Integer.parseInt(trimmed.substring(prefix.length()).trim());
+        }
+        catch (NumberFormatException ignored) {
+          return 0;
+        }
+      }
+    }
+    return 0;
   }
 
   /**
@@ -5162,9 +5425,9 @@ public final class SimpleIde {
     if (command == null || "help".equals(command) || "--help".equals(command) || "-h".equals(command))
       return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  reload  对 run --hot-reload 启动的 Spring Boot 应用触发一次热更新\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  build-status  查询最近一次构建的真实阶段/耗时/日志/失败原因\n  version 打印工具版本、jps-cli 摘要与缓存格式版本\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
     if ("list".equals(command)) return "用法: simple-ide list [--project <path>] [--running-only] [--clean] [--stop-all] [--table]\n\n列出 simple-ide 启动的所有应用并集中管控（支持跨项目汇总、展示 PID/端口/状态/日志；--running-only 仅看存活应用；--stop-all 一键集中停止所有应用；--clean 清理失效状态记录；--table 以表格格式输出）。\n";
-    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--no-auto-restart] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n存在运行中的应用且检测到待编译源文件时，默认先停止应用 → 用共享输出编译 → 成功后按原参数重启（避免改动只写进隔离目录、运行时仍是旧 class）；无待编译文件则不动应用。--no-auto-restart 关闭该行为。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n";
-    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--hot-reload] [--hot-reload-include <regex>]... [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port；两者都不指定时由 status/list 从进程监听端口自动探测实际端口。\n--hot-reload 仅支持 Spring Boot + --engine local：把内置 spring-boot-devtools-2.7.18-simpleide.jar 注入应用 classpath，并启用 trigger-file 热更新；之后用 simple-ide reload 触发。\n--hot-reload-include 把匹配的依赖 jar 加入 DevTools restart classpath（可重复，值为 URL 正则）；用于应用输出目录覆盖了依赖类、且该覆盖类引用应用代码的场景。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
-    if ("reload".equals(command)) return "用法: simple-ide reload --project <path> [--configuration <name>] [--timeout <sec>]\n\n对 run --hot-reload 启动的 Spring Boot 应用执行一次热更新：JPS 增量编译到共享 target/classes，然后更新 DevTools trigger 文件。\n返回 success/configuration/compiled/buildId/logFile/trigger/restartExpected；编译失败时返回 BUILD_FAILED 与结构化 build 信息，不触发重启。\n注意：该命令会直接写运行中应用的 target/classes（live write），这是 run --hot-reload 的显式取舍。\n";
+    if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--no-auto-restart] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n存在运行中的应用且检测到待编译源文件时，默认先停止应用 → 用共享输出编译 → 成功后按原参数重启（避免改动只写进隔离目录、运行时仍是旧 class）；无待编译文件则不动应用。--no-auto-restart 关闭该行为。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n设置 SIMPLE_IDE_HOTSWAP=1 时，构建成功后额外创建 .simple-ide/hotswap 工作目录并校验内置 agent jar，供后续 reload 使用方法体热替换。\n";
+    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--hot-reload] [--hot-reload-include <regex>]... [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port；两者都不指定时由 status/list 从进程监听端口自动探测实际端口。\n--hot-reload 仅支持 Spring Boot + --engine local：把内置 spring-boot-devtools-2.7.18-simpleide.jar 注入应用 classpath，并启用 trigger-file 热更新；之后用 simple-ide reload 触发。\n--hot-reload-include 把匹配的依赖 jar 加入 DevTools restart classpath（可重复，值为 URL 正则）；用于应用输出目录覆盖了依赖类、且该覆盖类引用应用代码的场景。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n设置 SIMPLE_IDE_HOTSWAP=1 时，注入内置 simple-ide-hotswap-agent.jar，启用方法体原地热替换；该模式与 --hot-reload 互斥。\n";
+    if ("reload".equals(command)) return "用法: simple-ide reload --project <path> [--configuration <name>] [--timeout <sec>]\n\n默认对 run --hot-reload 启动的 Spring Boot 应用执行 DevTools 热更新：JPS 增量编译到共享 target/classes，然后更新 DevTools trigger 文件。\n设置 SIMPLE_IDE_HOTSWAP=1 时改为方法体热替换：JPS 增量编译后把变更 class 交给内置 agent 执行 redefineClasses，不重启 Spring context；加字段/方法/改签名返回 SCHEMA_CHANGE_REQUIRES_RESTART。\n返回 success/configuration/compiled/redefined/skipped/classes；编译失败时返回 BUILD_FAILED 与结构化 build 信息，不触发重启。\n注意：该命令会直接写运行中应用的 target/classes（live write），这是显式取舍。\n";
     if ("debug".equals(command)) return "用法: simple-ide debug --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--vm-arg <arg>]...\n\n调试启动 Application（对齐 IDEA Debug 模式）。默认开启 JDWP 远程调试（默认端口 5005，可通过 --debug-port 自定义）。--random-port 自动选择空闲端口并传入 --server.port。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
     if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>] [--module <artifactId>] [--engine <jps|idea-mcp>] [--skip-build] [--timeout <sec>]\n\n运行单元测试。默认通过内置 JPS 增量编译并在本地 JUnit 平台执行，秒级反馈，不依赖 IDEA 运行。\n未指定 --module 时按测试源码所在模块推断作用域；多模块且无法唯一确定时显式报错。\n结果 JSON 通过真实解析判定 success，并区分 failed/skipped/aborted/notExecuted/containersFailed。\n";
     if ("status".equals(command)) return "用法: simple-ide status --project <path> [--configuration <name>] [--engine <local|idea-mcp>]\n\n默认 --engine local 查询本地运行状态；--engine idea-mcp 查询已运行的 IDEA MCP 状态。\n";

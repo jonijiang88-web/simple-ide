@@ -39,6 +39,9 @@ distributions {
         include("install.ps1")
         include("skills/**")
       }
+      from(project(":hotswap-agent").layout.buildDirectory.file("libs/simple-ide-hotswap-agent.jar")) {
+        into("lib")
+      }
       filesMatching("bin/*") {
         permissions {
           unix("rwxr-xr-x")
@@ -52,6 +55,10 @@ distributions {
     }
   }
 }
+
+tasks.named("installDist") { dependsOn(":hotswap-agent:jar") }
+tasks.named("distZip") { dependsOn(":hotswap-agent:jar") }
+tasks.named("distTar") { dependsOn(":hotswap-agent:jar") }
 
 tasks.test {
   systemProperty("simple.ide.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)

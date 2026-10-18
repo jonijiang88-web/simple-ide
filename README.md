@@ -27,6 +27,15 @@
 
 `run --hot-reload` 仅支持 Spring Boot + `--engine local`：把内置 `lib/spring-boot-devtools-2.7.18-simpleide.jar` 注入应用 classpath，并设置 `spring.devtools.restart.enabled=true` 与 trigger file。该 jar 基于上游 2.7.18，补丁为 `RestartClassLoader` 增加 parent-first 精确类列表（默认覆盖 Artemis 中 3 个纯 Spring 覆盖类），用于兼容应用输出目录覆盖依赖类的场景；若覆盖类自身引用应用代码（如 `DefaultWebResponseExceptionTranslator`），用重复的 `--hot-reload-include <url-regex>` 把对应依赖 jar 加入 restart classpath。随后 `simple-ide reload` 用 JPS 增量编译到共享 `target/classes`，再更新 `.simple-ide/devtools/trigger` 触发 DevTools 重启。该模式是开发期显式取舍：直接写运行中应用的 `target/classes`，且每次 reload 会重建整个 Spring 上下文（所有 Bean 重建、内存状态丢失），不是 JRebel 式按类热重载。若 classpath 存在 JRebel/HotSwapAgent，DevTools 会自动禁用重启，CLI 会直接拒绝。
 
+设置环境变量 `SIMPLE_IDE_HOTSWAP=1` 可启用 simple-ide 内置的方法体热替换 agent（与 `--hot-reload` 互斥）：
+
+```bash
+SIMPLE_IDE_HOTSWAP=1 ./simple-ide run --project /path/to/project --configuration Application
+SIMPLE_IDE_HOTSWAP=1 ./simple-ide reload --project /path/to/project --configuration Application
+```
+
+该模式通过 `-javaagent:lib/simple-ide-hotswap-agent.jar` 注入，`reload` 把 JPS 编译出的 class 交给 agent 执行 `redefineClasses`，**不重启 Spring context**，通常 1 秒级生效。只支持方法体变化；加字段/方法/改签名会返回 `SCHEMA_CHANGE_REQUIRES_RESTART`，需要重启或后续版本化能力。`build` 在启用该环境变量时会创建 `.simple-ide/hotswap/` 工作目录并校验 agent jar。
+
 `build --auto-rebuild` 先执行增量编译，仅在诊断命中 MapStruct 读取历史匿名内部类产物、或 class 文件读取损坏等缓存特征时，自动执行一次全量重建。`build --rebuild` 则是直接清理重建，二者语义不同：显式 `--rebuild` 不会额外叠加自动重建，运行中的应用会阻止清理。若项目存在运行中的 Application，命令不会清理输出目录，而是返回 `rebuildRequired`、`rebuildReason` 和 `runningConfigurations`；应先停止对应进程后重新执行构建。单独的 Lombok `builder()` 缺失或真实源码错误不会触发重建，避免掩盖真实代码或配置问题。
 
 构建超时从子进程启动时刻开始计时（不再等到输出读完才计时），超时/取消会先记录后代进程身份（PID + 启动时间令牌）、再优雅终止、最后对忽略 TERM 的存活后代强制终止并独立确认；根进程退出不作为整棵树已退出的依据。若无法枚举进程表或仍无法确认退出，会返回 `PROCESS_TREE_NOT_TERMINATED` 并列出存活 PID，绝不谎报完整回收（Java 8 下使用 `/proc`，Java 9+ 使用 `ProcessHandle`，POSIX 回退 `ps`；Windows 上若无法确认则同样返回未确认）。"未完整构建"标记在**真正启动前**写入 `.simple-ide/builds/incomplete.json`，只有构建成功才清除；下一次构建据此先自动执行一次全量重建。等待本地构建锁支持 `--lock-timeout <sec>` 超时。
