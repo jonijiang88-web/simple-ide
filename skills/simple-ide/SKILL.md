@@ -52,7 +52,13 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 "$SIMPLE_IDE" debug --project "$PROJECT_DIR" --configuration <name> --random-port [--debug-port <port>]
 # 或
 "$SIMPLE_IDE" run --project "$PROJECT_DIR" --configuration <name> --random-port --debug [--debug-port <port>]
+
+# 3. Spring Boot 热更新（开发期，全量 context 重启）
+"$SIMPLE_IDE" run --project "$PROJECT_DIR" --configuration <name> --random-port --hot-reload
+"$SIMPLE_IDE" reload --project "$PROJECT_DIR" --configuration <name>
 ```
+
+- `run --hot-reload` 仅支持 Spring Boot + `--engine local`：注入内置 `lib/spring-boot-devtools-2.7.18.jar`，设置 DevTools trigger-file；`reload` 会 JPS 增量编译到共享 `target/classes` 并更新 `.simple-ide/devtools/trigger`，由 DevTools 重启整个 Spring 上下文。会重建所有 Bean、丢失内存状态，不是 JRebel 式按类热重载；classpath 存在 JRebel/HotSwapAgent 时 DevTools 会自动禁用重启，CLI 直接拒绝。
 
 - `run` 默认本地进程**纯运行模式**（不挂 JDWP 调试代理），类加载与 JIT C2 优化全开，获得对齐 IDEA Run 的极致启动速度；`--engine idea-mcp` 才请求 IDEA 托管。
 - `debug` 命令（或 `run --debug`）对齐 IDEA Debug 模式，自动开启 JDWP 远程调试（默认端口 `5005`，可通过 `--debug-port <port>` 自定义）；返回 JSON 与 `status` 中暴露 `debugPort` 字段，方便 VS Code 等客户端随时轻量 Attach 调试。

@@ -49,6 +49,12 @@ public final class SimpleIde {
   static final String CACHE_FORMAT_VERSION = "2";
   /** 判定 npm 编译结果时最多从日志末尾读取的字节数。 */
   static final int LOG_TAIL_LIMIT_BYTES = 256 * 1024;
+  /** 内置 Spring Boot DevTools jar（内部统一 2.7.18）。 */
+  static final String DEVTOOLS_JAR_NAME = "spring-boot-devtools-2.7.18.jar";
+  /** 热更新触发文件与标记所在目录。 */
+  static final String HOT_RELOAD_DIR = ".simple-ide/devtools";
+  /** 热更新触发文件名（DevTools trigger-file 只匹配简单文件名）。 */
+  static final String HOT_RELOAD_TRIGGER_NAME = "trigger";
   /** 等待 IDEA 启动的最大秒数。 */
   private static final int IDEA_STARTUP_TIMEOUT_SEC = 120;
 
@@ -85,6 +91,7 @@ public final class SimpleIde {
         if ("build".equals(command.name)) { build(command); summary = "编译完成"; }
         else if ("run".equals(command.name)) { run(command); summary = "应用启动"; }
         else if ("debug".equals(command.name)) { run(command); summary = "调试启动"; }
+        else if ("reload".equals(command.name)) { reload(command); summary = "热更新"; }
         else if ("test".equals(command.name)) { test(command); summary = "测试完成"; }
         else if ("status".equals(command.name)) { status(command); summary = "状态查询"; }
         else if ("build-status".equals(command.name)) { buildStatus(command); summary = "构建状态查询"; }
@@ -862,6 +869,85 @@ public final class SimpleIde {
   }
 
   /**
+   * 查找内置 Spring Boot DevTools jar。
+   *
+   * <p>优先使用 {@code -Dsimple.ide.devtools.jar} 覆盖；否则从工具安装目录的 lib 查找，
+   * 最后回退到当前源码仓库的 lib（开发期）。
+   *
+   * @return DevTools jar 绝对路径；未找到时返回 null
+   */
+  static Path findDevtoolsJar() {
+    String override = System.getProperty("simple.ide.devtools.jar");
+    if (override != null && !override.trim().isEmpty()) {
+      Path path = Paths.get(override.trim()).toAbsolutePath().normalize();
+      if (Files.isRegularFile(path)) return path;
+    }
+    try {
+      URL location = SimpleIde.class.getProtectionDomain().getCodeSource().getLocation();
+      if (location != null) {
+        Path codePath = Paths.get(location.toURI());
+        Path dir = Files.isDirectory(codePath) ? codePath : codePath.getParent();
+        if (dir != null) {
+          Path candidate = dir.resolve(DEVTOOLS_JAR_NAME);
+          if (Files.isRegularFile(candidate)) return candidate;
+          Path sibling = dir.resolve("../lib/" + DEVTOOLS_JAR_NAME).normalize();
+          if (Files.isRegularFile(sibling)) return sibling;
+          Path nested = dir.resolve("lib/" + DEVTOOLS_JAR_NAME).normalize();
+          if (Files.isRegularFile(nested)) return nested;
+        }
+      }
+    }
+    catch (Exception ignored) {}
+    Path fallback = Paths.get("/home/lijiang/code/simple-ide/lib/" + DEVTOOLS_JAR_NAME);
+    if (Files.isRegularFile(fallback)) return fallback;
+    return null;
+  }
+
+  /**
+   * 判断 classpath 中是否包含文件名含指定片段的条目。
+   *
+   * @param classpath classpath 字符串
+   * @param namePart 文件名片段（小写比较）
+   * @return true 表示命中
+   */
+  static boolean classpathContainsJar(String classpath, String namePart) {
+    if (classpath == null || namePart == null) return false;
+    for (String entry : classpath.split(File.pathSeparator)) {
+      if (entry.trim().isEmpty()) continue;
+      try {
+        String name = Paths.get(entry).getFileName().toString().toLowerCase();
+        if (name.contains(namePart.toLowerCase())) return true;
+      }
+      catch (Exception ignored) {}
+    }
+    return false;
+  }
+
+  /** 热更新触发文件路径。 */
+  static Path hotReloadTrigger(Path project) {
+    return project.resolve(HOT_RELOAD_DIR).resolve(HOT_RELOAD_TRIGGER_NAME);
+  }
+
+  /** 热更新标记文件路径（按运行配置区分）。 */
+  static Path hotReloadMarker(Path project, String configuration) {
+    return project.resolve(HOT_RELOAD_DIR).resolve("hot-reload-" + configuration + ".json");
+  }
+
+  /**
+   * 创建热更新触发文件；已存在时不覆盖，避免 DevTools 启动快照误判。
+   *
+   * @param project 项目根目录
+   * @return 触发文件路径
+   * @throws java.io.IOException 创建失败
+   */
+  static Path ensureHotReloadTrigger(Path project) throws java.io.IOException {
+    Path trigger = hotReloadTrigger(project);
+    Files.createDirectories(trigger.getParent());
+    if (!Files.exists(trigger)) Files.write(trigger, new byte[0]);
+    return trigger;
+  }
+
+  /**
    * 查找项目依赖 Classpath 缓存文件（历史签名，取第一个命中项）。
    *
    * @param project 项目根目录
@@ -1013,8 +1099,8 @@ public final class SimpleIde {
    */
   private static BuildStatus buildViaJps(Path project, List<String> modules, List<String> files, int timeoutSec,
                                          boolean explicitRebuild, boolean autoRebuild, boolean forceIsolateCache,
-                                         boolean noIsolateCache, boolean autoRestartEnabled, BuildTracker tracker,
-                                         java.io.PrintStream jsonOut) {
+                                         boolean noIsolateCache, boolean autoRestartEnabled, boolean allowLiveWrite,
+                                         BuildTracker tracker, java.io.PrintStream jsonOut) {
     Path jpsJar = findJpsCliJar();
     if (jpsJar == null) return null;
     Path pomFile = project.resolve("pom.xml");
@@ -1084,6 +1170,12 @@ public final class SimpleIde {
 
     // 4) 唯一清理闸门：所有 clean 入口都必须先确认无运行中应用
     List<String> running = runningConfigurations(project);
+    // live reload 直接写共享 target/classes；清理重建会删除运行中应用正在使用的产物，必须拒绝
+    if (allowLiveWrite && clean) {
+      return failJps(project, tracker, jpsJar, timeoutSec, "LIVE_RELOAD_REQUIRES_RESTART", null, running, true,
+        rebuildReason, "本次构建需要清理共享输出（" + rebuildReason + "），不能对运行中应用执行 live reload；"
+          + "请先 simple-ide stop，再执行 build/rebuild 后重新 run --hot-reload。", 0, null, jsonOut, isolation);
+    }
     // 4') 运行中应用 + 待编译源文件：默认停止应用 → 用共享输出编译 → 成功后按原参数重启；
     //     否则「受保护构建」只把改动写进隔离目录，运行时仍是旧 class（--no-auto-restart 关闭该行为）。
     List<Map<String, Object>> restartPlan = prepareAutoRestart(project, tracker, autoRestartEnabled);
@@ -1100,7 +1192,11 @@ public final class SimpleIde {
     //    隔离输出：JPS 内部恢复带来的全量重建只写入隔离输出根，绝不删改运行中应用实际使用的
     //    target/classes、target/test-classes 与资源。
     //    隔离构建不发布到共享 target（延后发布语义），调用方通过 JSON 的 outputsPublished/targetOutputsStale 获知。
-    boolean isolateBuild = shouldIsolateCache(clean, forceIsolateCache, noIsolateCache, running.size());
+    boolean isolateBuild = allowLiveWrite ? false : shouldIsolateCache(clean, forceIsolateCache, noIsolateCache, running.size());
+    if (allowLiveWrite && !running.isEmpty()) {
+      System.err.println("[simple-ide] live reload 构建：直接写共享 target/classes（运行中应用会读取新产物）");
+      if (tracker != null) tracker.message("live reload：直接写共享 target/classes，不在隔离目录构建");
+    }
     Path isolatedCacheDir = null;
     Path isolatedOutputRoot = null;
     if (isolateBuild) {
@@ -2277,7 +2373,7 @@ public final class SimpleIde {
     BuildStatus status = null;
     if ("jps".equalsIgnoreCase(requestedEngine)) {
       status = buildViaJps(project, modules, files, timeoutSec, explicitRebuild, autoRebuild, forceIsolateCache, noIsolateCache,
-        !command.flag("no-auto-restart"), tracker, System.out);
+        !command.flag("no-auto-restart"), false, tracker, System.out);
       if (status == null && command.option("engine", null) == null) {
         status = buildViaMcp(project, modules, files, timeoutSec, explicitRebuild || autoRebuild);
       }
@@ -2302,8 +2398,10 @@ public final class SimpleIde {
     String configName = command.required("configuration");
     int port = configuredPort(command);
     String engine = command.option("engine", "local");
+    boolean hotReload = command.flag("hot-reload");
 
     if ("idea-mcp".equalsIgnoreCase(engine)) {
+      if (hotReload) throw new IllegalArgumentException("--hot-reload 仅支持 --engine local（DevTools 必须注入本地进程 classpath）");
       if (runViaMcp(project, configName, port, command)) return;
     }
 
@@ -2345,10 +2443,10 @@ public final class SimpleIde {
       }
       BuildStatus buildStatus;
       if (skipLock) {
-        buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
+        buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, false, null, null);
       } else {
         try (BuildLock ignored = BuildLock.acquire(project)) {
-          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
+          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, false, null, null);
         }
       }
       if (buildStatus != null && !buildStatus.success) {
@@ -2389,6 +2487,30 @@ public final class SimpleIde {
     }
     String classpath = plan.classpath;
 
+    Path devtoolsJar = null;
+    if (hotReload) {
+      if (!classpathContainsJar(classpath, "spring-boot-")) {
+        throw new IllegalStateException("--hot-reload 只支持 Spring Boot 应用：classpath 未发现 spring-boot-*.jar");
+      }
+      if (classpathContainsJar(classpath, "jrebel") || classpathContainsJar(classpath, "hotswap-agent")
+        || classpathContainsJar(classpath, "hotswapagent")) {
+        throw new IllegalStateException("检测到 JRebel/HotSwapAgent：DevTools 会自动禁用重启，不能同时启用 --hot-reload");
+      }
+      if (!classpathContainsJar(classpath, "spring-boot-devtools")) {
+        devtoolsJar = findDevtoolsJar();
+        if (devtoolsJar == null) {
+          throw new IllegalStateException("未找到内置 " + DEVTOOLS_JAR_NAME + "；请确认 lib 目录包含该 jar，"
+            + "或通过 -Dsimple.ide.devtools.jar 指定路径");
+        }
+        classpath = classpath + File.pathSeparator + devtoolsJar.toAbsolutePath();
+      }
+      ensureHotReloadTrigger(project);
+      vmParams.add("-Dspring.devtools.restart.enabled=true");
+      vmParams.add("-Dspring.devtools.restart.trigger-file=" + HOT_RELOAD_TRIGGER_NAME);
+      vmParams.add("-Dspring.devtools.restart.additional-paths="
+        + project.resolve(HOT_RELOAD_DIR).toAbsolutePath());
+    }
+
     List<String> processCommand = buildJavaCommandLine(
         command.option("java", "java"),
         vmParams,
@@ -2407,7 +2529,99 @@ public final class SimpleIde {
       .start();
     RunState state = new RunState(getPid(process), log, port, debugPort, project.toString(), processCommand);
     state.write(stateFile);
-    System.out.println(json(state.toMap(port > 0 ? "STARTING" : "RUNNING")));
+    Path marker = hotReloadMarker(project, configuration.name);
+    if (hotReload) {
+      Map<String, Object> markerData = mapOf(
+        "configuration", configuration.name,
+        "module", configuration.module,
+        "devtoolsJar", devtoolsJar != null ? devtoolsJar.toAbsolutePath().toString() : "project-classpath",
+        "trigger", hotReloadTrigger(project).toAbsolutePath().toString(),
+        "startedAt", System.currentTimeMillis());
+      Files.createDirectories(marker.getParent());
+      Files.write(marker, json(markerData).getBytes(StandardCharsets.UTF_8));
+    }
+    else {
+      Files.deleteIfExists(marker);
+    }
+    Map<String, Object> result = state.toMap(port > 0 ? "STARTING" : "RUNNING");
+    if (hotReload) {
+      result.put("hotReload", true);
+      result.put("trigger", hotReloadTrigger(project).toAbsolutePath().toString());
+      if (devtoolsJar != null) result.put("devtoolsJar", devtoolsJar.toAbsolutePath().toString());
+    }
+    System.out.println(json(result));
+  }
+
+  /**
+   * 对运行中的 Spring Boot 应用执行一次 live reload：增量编译到共享 target/classes，
+   * 再更新 DevTools trigger 文件触发上下文重启。
+   *
+   * <p>前提：应用由 {@code run --hot-reload} 启动，且 classpath 上有 DevTools。
+   *
+   * @param command 命令参数
+   * @throws Exception 读取配置、构建或写 trigger 失败
+   */
+  private static void reload(Command command) throws Exception {
+    Path project = command.project();
+    String configName = command.option("configuration", "Application");
+    ApplicationConfiguration configuration = ApplicationConfiguration.load(project, configName);
+    RunState state = RunState.read(runState(project, configName));
+    if (state == null || !isProcessAlive(state.pid)) {
+      System.out.println(json(mapOf("success", false, "configuration", configName,
+        "errorCode", "NOT_RUNNING", "error", "Application 未运行：" + configName)));
+      System.exit(1);
+      return;
+    }
+    Path marker = hotReloadMarker(project, configName);
+    if (!Files.isRegularFile(marker)) {
+      System.out.println(json(mapOf("success", false, "configuration", configName,
+        "errorCode", "HOT_RELOAD_NOT_ENABLED",
+        "error", "该 Application 不是通过 run --hot-reload 启动的；请停止后重新用 --hot-reload 启动")));
+      System.exit(1);
+      return;
+    }
+    Path trigger = ensureHotReloadTrigger(project);
+    List<String> modules = new ArrayList<String>();
+    if (configuration.module != null && !configuration.module.trim().isEmpty()) {
+      modules.add(configuration.module);
+    }
+    int timeoutSec = Integer.parseInt(command.option("timeout", "600"));
+    BuildTracker tracker = BuildTracker.start(project, "jps", modules, timeoutSec, false);
+    tracker.startHeartbeat(System.err);
+    BuildStatus status;
+    try {
+      try (BuildLock ignored = BuildLock.acquire(project)) {
+        status = buildViaJps(project, modules, null, timeoutSec, false, false, false, false, false, true, tracker, null);
+      }
+    }
+    finally {
+      tracker.close();
+    }
+    if (status == null) {
+      System.out.println(json(mapOf("success", false, "configuration", configName,
+        "errorCode", "NO_ENGINE", "error", "JPS 构建引擎不可用")));
+      System.exit(1);
+      return;
+    }
+    if (!status.success) {
+      Map<String, Object> build = JsonParser.tryParseObject(status.jsonResult);
+      Map<String, Object> failure = mapOf("success", false, "configuration", configName,
+        "errorCode", "BUILD_FAILED", "build", build != null ? build : status.jsonResult,
+        "buildId", tracker.buildId(), "logFile", tracker.logFile().toAbsolutePath().toString());
+      System.out.println(json(failure));
+      System.exit(1);
+      return;
+    }
+    Files.write(trigger, ("reload " + System.currentTimeMillis() + "\n").getBytes(StandardCharsets.UTF_8));
+    System.out.println(json(mapOf(
+      "success", true,
+      "configuration", configName,
+      "compiled", true,
+      "buildId", tracker.buildId(),
+      "logFile", tracker.logFile().toAbsolutePath().toString(),
+      "trigger", trigger.toAbsolutePath().toString(),
+      "restartExpected", true,
+      "note", "DevTools 轮询触发文件（默认 1s + 400ms quiet period）后重启 context；可用 logs 查看结果")));
   }
 
   /**
@@ -3013,10 +3227,10 @@ public final class SimpleIde {
         if (moduleHint != null && !moduleHint.trim().isEmpty()) buildModules.add(moduleHint);
         BuildStatus buildStatus;
         if (skipLock) {
-          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
+          buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, false, null, null);
         } else {
           try (BuildLock ignored = BuildLock.acquire(project)) {
-            buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, null, null);
+            buildStatus = buildViaJps(project, buildModules, null, timeoutSec, false, false, false, false, false, false, null, null);
           }
         }
         if (buildStatus != null && !buildStatus.success) {
@@ -4933,10 +5147,11 @@ public final class SimpleIde {
   /** 返回帮助文本。 */
   static String helpText(String command) {
     if (command == null || "help".equals(command) || "--help".equals(command) || "-h".equals(command))
-      return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  build-status  查询最近一次构建的真实阶段/耗时/日志/失败原因\n  version 打印工具版本、jps-cli 摘要与缓存格式版本\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
+      return "用法: simple-ide <command> [options]\n\n命令:\n  build   编译项目模块（默认内置 JPS 增量引擎，秒级编译）\n  run     启动 Application 配置（默认纯运行模式，对齐 IDEA Run）\n  debug   调试启动 Application 配置（自动开启 JDWP 调试端口，对齐 IDEA Debug）\n  reload  对 run --hot-reload 启动的 Spring Boot 应用触发一次热更新\n  test    运行单元测试（默认本地 JPS 编译与 JUnit 平台执行）\n  status  查询应用状态\n  build-status  查询最近一次构建的真实阶段/耗时/日志/失败原因\n  version 打印工具版本、jps-cli 摘要与缓存格式版本\n  list    列出 simple-ide 启动的所有应用并集中管控\n  logs    查询应用日志尾部\n  stop    停止应用进程\n  report  生成并在浏览器中打开 HTML 状态报告\n\n环境变量:\n  IJ_MCP_SERVER_PORT  IDEA MCP Server 端口（默认 64342）\n\n使用 `simple-ide <command> --help` 查看子命令参数。\n";
     if ("list".equals(command)) return "用法: simple-ide list [--project <path>] [--running-only] [--clean] [--stop-all] [--table]\n\n列出 simple-ide 启动的所有应用并集中管控（支持跨项目汇总、展示 PID/端口/状态/日志；--running-only 仅看存活应用；--stop-all 一键集中停止所有应用；--clean 清理失效状态记录；--table 以表格格式输出）。\n";
     if ("build".equals(command)) return "用法: simple-ide build --project <path> [--module <artifactId>] [--rebuild | --auto-rebuild] [--no-auto-restart] [--lock-timeout <sec>] [--no-lock] [--engine <jps|idea-mcp>] [--timeout <sec>]\n\n编译项目。默认使用内置 JPS 增量编译引擎（秒级增量编译，不依赖 IDEA 运行）。默认启用本地构建排队锁，避免并发编译资源竞争。\n\n--rebuild 直接从清理共享输出开始重建；若存在运行中的 Application 会拒绝清理并返回 rebuildRequired/rebuildReason/runningConfigurations。\n--auto-rebuild 先执行增量编译，仅当命中明确的缓存/历史 class 损坏特征时才自动全量重建一次；真实源码错误或 Lombok builder 缺失不会触发重建。\n--module 限定构建模块（自动包含其依赖模块）；JPS 不支持 --file 文件粒度作用域，非空时会显式拒绝而非静默忽略。\n存在运行中的应用且检测到待编译源文件时，默认先停止应用 → 用共享输出编译 → 成功后按原参数重启（避免改动只写进隔离目录、运行时仍是旧 class）；无待编译文件则不动应用。--no-auto-restart 关闭该行为。\n--isolate-cache 强制使用隔离缓存目录构建（默认在「存在运行中应用且未授权清理」时已自动隔离），使 JPS 内部的删除重建只影响隔离副本；--no-isolate-cache 关闭该保护。\n退出码：编译失败=1，增量存储损坏需显式重建=3，依赖解析失败=4，构建锁被遗留进程占用=5。\n超时/取消会记录后代进程身份后回收整棵子进程树；无法枚举进程表或仍无法确认退出时返回 PROCESS_TREE_NOT_TERMINATED 并列出存活 PID（不承诺无法保证的强杀恢复）。\n构建过程实时向 stderr 输出进度与心跳，stdout 仅输出稳定单行 JSON（含 success/errorCode/phase/diagnostics/buildId/pid/logFile）。\n";
-    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port；两者都不指定时由 status/list 从进程监听端口自动探测实际端口。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
+    if ("run".equals(command)) return "用法: simple-ide run --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--hot-reload] [--vm-arg <arg>]...\n\n启动 Application。默认纯运行模式（读取 runConfigurations 配置并注入 JPS 编译依赖 Classpath，对齐 IDEA Run 极致性能）。可选 --debug 或 --debug-port 开启 JDWP 远程调试。--random-port 自动选择空闲端口并传入 --server.port；两者都不指定时由 status/list 从进程监听端口自动探测实际端口。\n--hot-reload 仅支持 Spring Boot + --engine local：把内置 spring-boot-devtools-2.7.18.jar 注入应用 classpath，并启用 trigger-file 热更新；之后用 simple-ide reload 触发。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
+    if ("reload".equals(command)) return "用法: simple-ide reload --project <path> [--configuration <name>] [--timeout <sec>]\n\n对 run --hot-reload 启动的 Spring Boot 应用执行一次热更新：JPS 增量编译到共享 target/classes，然后更新 DevTools trigger 文件。\n返回 success/configuration/compiled/buildId/logFile/trigger/restartExpected；编译失败时返回 BUILD_FAILED 与结构化 build 信息，不触发重启。\n注意：该命令会直接写运行中应用的 target/classes（live write），这是 run --hot-reload 的显式取舍。\n";
     if ("debug".equals(command)) return "用法: simple-ide debug --project <path> [--configuration <name>] [--random-port | --port <number>] [--debug-port <port>] [--java <path>] [--engine <local|idea-mcp>] [--skip-build] [--vm-arg <arg>]...\n\n调试启动 Application（对齐 IDEA Debug 模式）。默认开启 JDWP 远程调试（默认端口 5005，可通过 --debug-port 自定义）。--random-port 自动选择空闲端口并传入 --server.port。\n--vm-arg 追加 JVM 启动参数（可重复，原样透传并插在 -cp 之前），用于启动期 profiling 等：\n  simple-ide run --project <path> --vm-arg '-agentpath:/path/libasyncProfiler.so=start,event=wall,interval=1ms,timeout=120,file=/tmp/boot.html,threads,simple'\n";
     if ("test".equals(command)) return "用法: simple-ide test --project <path> --class <FQN> [--method <name>] [--module <artifactId>] [--engine <jps|idea-mcp>] [--skip-build] [--timeout <sec>]\n\n运行单元测试。默认通过内置 JPS 增量编译并在本地 JUnit 平台执行，秒级反馈，不依赖 IDEA 运行。\n未指定 --module 时按测试源码所在模块推断作用域；多模块且无法唯一确定时显式报错。\n结果 JSON 通过真实解析判定 success，并区分 failed/skipped/aborted/notExecuted/containersFailed。\n";
     if ("status".equals(command)) return "用法: simple-ide status --project <path> [--configuration <name>] [--engine <local|idea-mcp>]\n\n默认 --engine local 查询本地运行状态；--engine idea-mcp 查询已运行的 IDEA MCP 状态。\n";
@@ -5335,7 +5550,7 @@ public final class SimpleIde {
 
     /** 解析 --key value、--key=value 和布尔标记。 */
     static Command parse(String[] arguments) {
-      if (arguments.length == 0) throw new IllegalArgumentException("用法：simple-ide <build|run|status|stop> --project <目录>");
+      if (arguments.length == 0) throw new IllegalArgumentException("用法：simple-ide <build|run|reload|status|stop> --project <目录>");
       Map<String, List<String>> options = new LinkedHashMap<String, List<String>>();
       for (int index = 1; index < arguments.length; index++) {
         String argument = arguments[index];
