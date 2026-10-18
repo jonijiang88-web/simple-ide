@@ -138,6 +138,20 @@ public final class HotswapRuntime implements OriginalClassStore {
       if (kind == ChangeKind.HIERARCHY || kind == ChangeKind.UNSUPPORTED) {
         throw new UnsupportedOperationException("class change is not hot-reloadable: " + kind);
       }
+      if (kind == ChangeKind.METHOD_BODY) {
+        if (state.currentVersionClass == null) {
+          // 还没有 V0：直接以新字节作为首次版本基线，避免创建后再 retransform。
+          state.original = newBytes.clone();
+          state.currentBytes = newBytes.clone();
+          return;
+        }
+        byte[] versionBytes = versionGenerator.generate(newBytes, className,
+          state.currentVersionClass.getName());
+        versionBytes = staticRewriter.rewriteVersion(versionBytes, className);
+        retransformVersion(state.currentVersionClass, versionBytes);
+        state.currentBytes = newBytes.clone();
+        return;
+      }
       int number = state.counter.getAndIncrement();
       Class<?> versionClass = defineVersion(original, className, newBytes, number);
       state.currentVersionClass = versionClass;
@@ -149,6 +163,34 @@ public final class HotswapRuntime implements OriginalClassStore {
         delegateField(original).set(facade, next);
         recordVersionHistory(facade, next);
       }
+    }
+  }
+
+  /**
+   * 对当前版本类执行 retransform，仅更新方法体。
+   *
+   * @param versionClass 当前版本类
+   * @param versionBytes 重映射到版本类名的新字节
+   * @throws Exception retransform 失败
+   */
+  private void retransformVersion(Class<?> versionClass, byte[] versionBytes) throws Exception {
+    ClassFileTransformer transformer = new ClassFileTransformer() {
+      @Override
+      public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
+                              ProtectionDomain protectionDomain, byte[] classfileBuffer) {
+        if (classBeingRedefined == versionClass
+          && versionClass.getName().replace('.', '/').equals(className)) {
+          return versionBytes.clone();
+        }
+        return null;
+      }
+    };
+    instrumentation.addTransformer(transformer, true);
+    try {
+      instrumentation.retransformClasses(versionClass);
+    }
+    finally {
+      instrumentation.removeTransformer(transformer);
     }
   }
 
