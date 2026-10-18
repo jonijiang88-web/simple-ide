@@ -14,6 +14,8 @@ dependencies {
   implementation("org.ow2.asm:asm:9.9.1")
   implementation("org.ow2.asm:asm-commons:9.9.1")
   testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+  // Gradle 9 的测试进程需要显式提供 JUnit Platform launcher。
+  testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 tasks.test {
