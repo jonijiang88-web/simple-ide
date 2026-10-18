@@ -1,2 +1,6 @@
-io.simpleide.hotswap.integration.spring.SpringPlugin
+io.simpleide.hotswap.integration.spring.SpringBootPlugin
 io.simpleide.hotswap.integration.spring.SpringMvcPlugin
+io.simpleide.hotswap.integration.spring.tx.TransactionPlugin
+io.simpleide.hotswap.integration.spring.cache.CachePlugin
+io.simpleide.hotswap.integration.jackson.JacksonPlugin
+io.simpleide.hotswap.integration.mybatis.MyBatisPlugin
