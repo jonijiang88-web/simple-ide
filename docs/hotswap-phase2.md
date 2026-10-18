@@ -123,15 +123,18 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 
 - Spring Boot 2.7 / Spring 5.3
 - 已有 Controller 方法体变化
-- 新增或修改 `@RequestMapping` 方法
-- 新字段通过已有访问器使用
+- 新增或修改 `@RequestMapping` 方法（含字段与方法同时变化）
+- 已有事务/缓存方法的元数据刷新
+- Jackson ObjectMapper 序列化/反序列化缓存刷新
+- MyBatis mapper 注解重解析与 MappedStatement 刷新
 
 暂不支持：
 
 - `@ControllerAdvice` 的结构性变化
 - `@Configuration` / `@Bean` 增删
-- `@Transactional` / `@Cacheable` 等代理注解变化
-- Jackson / MyBatis 元数据（Phase 3/4）
+- 新增事务/缓存方法时重建 Spring 代理
+- Jackson facade 反射不可见的新 DTO 字段
+- MyBatis XML 单独变化自动触发（需同时触发 mapper reload）
 
 ## 固定版本
 
