@@ -2905,6 +2905,7 @@ public final class SimpleIde {
     ensureHotswapWorkspace(project);
     Path classesRoot = hotswapDirectory(project).resolve("classes");
     List<String> relativePaths = new ArrayList<String>();
+    List<Path> changedXml = new ArrayList<Path>();
     List<ModuleResolver.Module> resolved = ModuleResolver.resolve(project);
     ModuleResolver.Module target = resolved.isEmpty() ? null
       : ModuleResolver.select(resolved, configuration.module);
@@ -2919,10 +2920,16 @@ public final class SimpleIde {
         while (iterator.hasNext()) {
           Path file = iterator.next();
           String name = file.getFileName().toString();
-          if (!Files.isRegularFile(file) || !name.endsWith(".class")) {
+          if (!Files.isRegularFile(file)) {
             continue;
           }
           if (Files.getLastModifiedTime(file).toMillis() < changedSince - 2000L) {
+            continue;
+          }
+          if (!name.endsWith(".class")) {
+            if (name.endsWith(".xml")) {
+              changedXml.add(file);
+            }
             continue;
           }
           String relative = output.relativize(file).toString().replace(File.separatorChar, '/');
@@ -2931,6 +2938,23 @@ public final class SimpleIde {
           Files.copy(file, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
           relativePaths.add(relative);
         }
+      }
+    }
+    for (Path xml : changedXml) {
+      String namespace = mapperNamespace(xml);
+      if (namespace == null) {
+        continue;
+      }
+      for (ModuleResolver.Module module : closure) {
+        String relative = namespace.replace('.', '/') + ".class";
+        Path classFile = module.outputDir.resolve(relative);
+        if (!Files.isRegularFile(classFile) || relativePaths.contains(relative)) {
+          continue;
+        }
+        Path destination = classesRoot.resolve(relative);
+        Files.createDirectories(destination.getParent());
+        Files.copy(classFile, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        relativePaths.add(relative);
       }
     }
     List<String> submittedClasses = filterHotswapClasses(relativePaths, requestedClasses);
@@ -2983,6 +3007,28 @@ public final class SimpleIde {
       "error", "等待 hotswap agent 结果超时（" + waitTimeout + "s）",
       "classes", submittedClasses,
       "agentLog", tail(hotswapDirectory(project).resolve("agent.log"), 20));
+  }
+
+  /**
+   * 从 MyBatis mapper XML 中读取 namespace。
+   *
+   * <p>XML 单独变化也需要触发一次 mapper 类 reload，插件才能重读 XML；这里只识别
+   * 带 namespace 属性的 mapper XML，普通资源不会触发类热替换。
+   *
+   * @param xml XML 文件
+   * @return mapper 类名；不是 mapper XML 时返回 null
+   */
+  static String mapperNamespace(Path xml) {
+    try {
+      String content = new String(Files.readAllBytes(xml), StandardCharsets.UTF_8);
+      java.util.regex.Matcher matcher = java.util.regex.Pattern
+        .compile("namespace\\s*=\\s*[\"']([^\"']+)[\"']")
+        .matcher(content);
+      return matcher.find() ? matcher.group(1).trim() : null;
+    }
+    catch (Exception ignored) {
+      return null;
+    }
   }
 
   /**
