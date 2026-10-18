@@ -59,7 +59,13 @@ description: 使用 simple-ide 一站式 CLI 编译、运行、测试及集中�
 ```
 
 - `run --hot-reload` 仅支持 Spring Boot + `--engine local`：注入内置 `lib/spring-boot-devtools-2.7.18-simpleide.jar`，设置 DevTools trigger-file；该 jar 基于上游 2.7.18，补丁让 `RestartClassLoader` 对 3 个纯 Spring 覆盖类优先委托父加载器，用于兼容 Artemis 这类在 `src/main/java/org/springframework/...` 覆盖依赖类的工程。覆盖类若引用应用代码，用 `--hot-reload-include <url-regex>` 把对应依赖 jar 加入 restart classpath。`reload` 会 JPS 增量编译到共享 `target/classes` 并更新 `.simple-ide/devtools/trigger`，由 DevTools 重启整个 Spring 上下文。会重建所有 Bean、丢失内存状态，不是 JRebel 式按类热重载；classpath 存在 JRebel/HotSwapAgent 时 DevTools 会自动禁用重启，CLI 直接拒绝。
-- 设置 `SIMPLE_IDE_HOTSWAP=1` 启用内置 JRebel 式 facade + 类版本化热替换，与 `--hot-reload` 互斥：`run` 注入 `lib/simple-ide-hotswap-agent.jar`，加载期改写应用类，`reload` 创建新版本类并迁移字段，不重启 Spring context。支持加字段、加方法、改签名、字段状态迁移；`--hotswap-include <prefix>` 可限定改写包前缀。内部类、静态方法体、反射新增成员、Spring BeanDefinition/MVC/AOP 元数据仍不支持；父类/接口、native、枚举会返回不可热替换错误。`build` 在启用时会创建 `.simple-ide/hotswap/` 并校验 agent jar。
+- 设置 `SIMPLE_IDE_HOTSWAP=1` 启用内置 JRebel 式 facade + 类版本化热替换，与 `--hot-reload` 互斥。`run` 注入 `lib/simple-ide-hotswap-agent.jar`，加载期改写应用类；`reload`/`build` 创建新版本类并迁移字段，不重启 Spring context。`--hotswap-include <prefix>` 可限定改写包前缀。
+- Java 8 / Spring Boot 2.7.18 / Spring 5.3.31 / Jackson 2.13.5 / MyBatis 3.5.13 是当前固定验证基线。agent 还通过 ServiceLoader 加载可选适配器；`run` 会把 `lib/simple-ide-hotswap-jackson-adapter.jar`、`lib/simple-ide-hotswap-mybatis-adapter.jar` 加入应用 Classpath。
+- 支持：已有方法体、已有字段状态、加字段、加方法、改方法签名、静态字段共享、编译期调用点改写（Controller/Service 直接调用新增方法）、Spring Boot 上下文/字段注入、Spring MVC 新增或修改 Controller 映射、Transaction/Cache 元数据刷新、Jackson 新增 DTO 字段序列化/反序列化、MyBatis mapper SQL/XML、MyBatis 新 DTO 字段结果映射、mapper XML SQL 变更自动触发 reload。
+- 预检/重启边界：类含内部类、匿名类、nest 成员、`this$0`、native 方法时不做 facade，schema/signature 变更返回 `INNER_CLASS_REQUIRES_RESTART` 或 `NATIVE_METHOD_REQUIRES_RESTART`。父类/接口变化、枚举、类修饰符变化、`@Configuration`/`@Bean` 增删、`@ControllerAdvice` 结构变化、Mapper 接口新增方法、Spring 代理方法新增的事务/缓存语义、直接字段访问、静态方法体和构造器改写仍可能不支持或需要重启。
+- `SIMPLE_IDE_HOTSWAP=1 simple-ide build` 在存在同模式运行中应用时，会 live-write `target/classes`，自动把本轮变更 class/资源提交给 agent，输出 `hotswapReload`（单配置）或 `hotswapReloads`；`--configuration <name>` 限定配置。构建失败/不支持结构时检查 `errorCode`，不要把 `success:true` 当作所有结构都可热更。
+- 耗时统计：`build` JSON 的 `durationMs` 是编译耗时；应用启动耗时看日志中的 `Started ... in` 或从 `run` 到 `status` 就绪的墙钟时间；`hotswapReload` 的 `redefined`/`classes` 和 build 整体 `durationMs` 共同反映热更耗时。不要把全量启动耗时和增量 reload 耗时混在一起。
+- 内部类/新增方法/反射等能力随版本演进；使用前先跑一个项目 smoke：已有方法体、新增字段、新增 Controller 方法、DTO 字段、Mapper SQL、Mapper DTO 字段各验证一次。
 
 - `run` 默认本地进程**纯运行模式**（不挂 JDWP 调试代理），类加载与 JIT C2 优化全开，获得对齐 IDEA Run 的极致启动速度；`--engine idea-mcp` 才请求 IDEA 托管。
 - `debug` 命令（或 `run --debug`）对齐 IDEA Debug 模式，自动开启 JDWP 远程调试（默认端口 `5005`，可通过 `--debug-port <port>` 自定义）；返回 JSON 与 `status` 中暴露 `debugPort` 字段，方便 VS Code 等客户端随时轻量 Attach 调试。
