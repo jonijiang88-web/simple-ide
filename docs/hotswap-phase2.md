@@ -134,7 +134,7 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 - `@Configuration` / `@Bean` 增删
 - 新增事务/缓存方法时重建 Spring 代理
 - Jackson facade 反射不可见的新 DTO 字段
-- MyBatis XML 单独变化自动触发（需同时触发 mapper reload）
+- MyBatis XML 中无法解析 namespace 或没有对应 mapper class 的资源变化
 
 ## 固定版本
 
@@ -159,7 +159,7 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 | TransactionPlugin | 事务执行 | 清属性缓存 | - | 代理重建不在范围 |
 | CachePlugin | 缓存执行 | 版本感知 CacheOperationSource | - | 不清业务缓存数据 |
 | JacksonPlugin | 序列化执行 | 清 Jackson 缓存 | 新 DTO 字段仍需后续适配 | 清 ObjectMapper 缓存 |
-| MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | - | XML 变化需触发 mapper reload |
+| MyBatisPlugin | SQL 执行 | 重解析 mapper 注解/XML | - | mapper XML 变化自动触发对应类 reload |
 
 ## build 自动 reload
 
