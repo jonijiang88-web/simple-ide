@@ -12,10 +12,12 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -23,32 +25,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class CallSiteRewriterTest {
 
-  /** 应用类之间新增方法的调用应改成静态桥调用。 */
+  /** 应用类之间新增方法的调用应改成 invokedynamic 转发。 */
   @Test
-  void rewritesApplicationCallToGeneratedBridge(@TempDir Path output) throws Exception {
+  void rewritesApplicationCallToInvokeDynamic(@TempDir Path output) throws Exception {
     writeClass(output, targetClass());
     writeClass(output, callerClass());
 
     CallSiteRewriter.rewrite(Collections.singletonList(output));
 
     ClassNode caller = read(output.resolve("com/demo/Caller.class"));
-    boolean bridgeCall = false;
+    boolean indyCall = false;
     for (MethodNode method : caller.methods) {
       for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;
            instruction = instruction.getNext()) {
-        if (instruction instanceof MethodInsnNode) {
-          MethodInsnNode call = (MethodInsnNode) instruction;
-          if (call.getOpcode() == Opcodes.INVOKESTATIC
-            && call.owner.startsWith("io/simpleide/hotswap/generated/CallBridge")) {
-            bridgeCall = true;
+        if (instruction instanceof InvokeDynamicInsnNode) {
+          InvokeDynamicInsnNode call = (InvokeDynamicInsnNode) instruction;
+          if (call.bsm != null && call.bsm.getOwner().contains("HotswapBootstrap")) {
+            indyCall = true;
           }
         }
       }
     }
-    // 验证：调用点被改为生成的静态桥
-    assertTrue(bridgeCall);
-    // 验证：桥类已写入输出目录
-    assertTrue(Files.isDirectory(output.resolve("io/simpleide/hotswap/generated")));
+    // 验证：调用点被改为 Runtime bootstrap 的 invokedynamic
+    assertTrue(indyCall);
+    // 验证：不再生成桥类目录
+    assertFalse(Files.isDirectory(output.resolve("io/simpleide/hotswap/generated")));
   }
 
   /** 普通应用类不应被改写为 JDK 调用。 */

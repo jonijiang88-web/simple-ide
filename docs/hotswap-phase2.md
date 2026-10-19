@@ -170,9 +170,9 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 设置 `SIMPLE_IDE_HOTSWAP_CALLSITES=1` 后，simple-ide 会在 JPS 编译成功后对项目输出 class 做一次编译后处理（默认关闭，避免大型工程和特殊代理风险）：
 
 - 扫描项目输出中的 class 集合
-- 把应用类之间的实例方法调用（`invokevirtual` / `invokeinterface`）改成生成的静态桥
-- 桥方法通过 `HotswapRuntime.invoke` 解析当前版本类
-- 为每次调用签名生成唯一桥类，避免已加载桥类无法新增方法
+- 把应用类之间的实例方法调用（`invokevirtual` / `invokeinterface`）改成 `invokedynamic` 转发
+- bootstrap 通过 `HotswapRuntime.invoke` 解析当前版本类
+- 使用 `HotswapBootstrap` 在运行时适配原始方法描述符，不生成桥类方法表
 
 这样即使 `UserService` 是 Spring 自动注入的 facade Bean，Controller 中重新编译的：
 
