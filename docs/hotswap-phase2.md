@@ -167,7 +167,7 @@ reload 前会检查新 class 的结构，命中以下场景时直接返回明确
 
 ## 编译期调用点改写
 
-设置 `SIMPLE_IDE_HOTSWAP_CALLSITES=1` 后，simple-ide 会在 JPS 编译成功后对项目输出 class 做一次编译后处理（默认关闭，避免大型工程和特殊代理风险）：
+simple-ide 默认在 JPS 编译成功后对项目输出 class 做一次调用点后处理；设置 `SIMPLE_IDE_HOTSWAP_CALLSITES=0` 可关闭：
 
 - 扫描项目输出中的 class 集合
 - 把应用类之间的实例方法调用（`invokevirtual` / `invokeinterface`）改成 `invokedynamic` 转发
