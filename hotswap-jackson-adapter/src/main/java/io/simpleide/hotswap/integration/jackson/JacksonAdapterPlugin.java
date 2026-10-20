@@ -166,7 +166,7 @@ public final class JacksonAdapterPlugin implements HotswapPlugin {
   }
 
   /**
-   * 清理 ObjectMapper 根部反序列化缓存，确保新安装的 modifier 从下一次请求开始生效。
+   * 清理根部及内部反序列化缓存，确保新安装的 modifier 生效，包括非 Map 的 LRU 缓存。
    *
    * @param mapper Jackson ObjectMapper
    */
@@ -176,6 +176,7 @@ public final class JacksonAdapterPlugin implements HotswapPlugin {
       clearMap(root);
       Object context = readField(mapper, "_deserializationContext");
       Object cache = readField(context, "_cache");
+      invokeNoArg(cache, "flushCachedDeserializers");
       clearMap(cache);
       for (java.lang.reflect.Field field : cache.getClass().getDeclaredFields()) {
         if (java.util.Map.class.isAssignableFrom(field.getType())) {

@@ -7,7 +7,6 @@ import io.simpleide.hotswap.api.HotswapNames;
 import io.simpleide.hotswap.api.MethodDispatcher;
 import io.simpleide.hotswap.api.OriginalClassStore;
 import io.simpleide.hotswap.api.SchemaClassifier;
-import io.simpleide.hotswap.api.StateMigrator;
 import io.simpleide.hotswap.api.VersionClassGenerator;
 import io.simpleide.hotswap.classify.AsmSchemaClassifier;
 import io.simpleide.hotswap.dispatch.ReflectionMethodDispatcher;
@@ -56,7 +55,7 @@ public final class HotswapRuntime implements OriginalClassStore {
   private final MethodDispatcher dispatcher = new ReflectionMethodDispatcher();
   private final VersionClassGenerator versionGenerator = new AsmVersionClassGenerator();
   private final ClassDefiner classDefiner = new RuntimeClassDefiner();
-  private final StateMigrator stateMigrator = new ReflectionStateMigrator();
+  private final ReflectionStateMigrator stateMigrator = new ReflectionStateMigrator();
   private final SharedStaticState staticState = SharedStaticState.getInstance();
   private final StaticAccessRewriter staticRewriter = new StaticAccessRewriter();
   private final SchemaClassifier classifier = new AsmSchemaClassifier();
@@ -346,7 +345,7 @@ public final class HotswapRuntime implements OriginalClassStore {
   }
 
   /**
-   * 创建 facade 外壳并绑定版本对象。
+   * 创建 facade 外壳并绑定版本对象，同步已有字段供 Bean Validation 等反射读取。
    *
    * @param facadeClass facade 类
    * @param version 版本对象
@@ -361,6 +360,7 @@ public final class HotswapRuntime implements OriginalClassStore {
       throw new IllegalArgumentException("not a facade class: " + facadeClass.getName());
     }
     Object facade = allocate(facadeClass);
+    stateMigrator.copy(version, facade);
     delegateField(facadeClass).set(facade, version);
     registerFacade(facadeClass, facade);
     return facade;
@@ -413,7 +413,7 @@ public final class HotswapRuntime implements OriginalClassStore {
   }
 
   /**
-   * 执行 facade 转发。
+   * 执行 facade 转发，先同步框架在版本创建后注入的依赖，保留版本内普通业务状态。
    *
    * @param facade facade 对象
    * @param methodName 方法名
@@ -428,6 +428,7 @@ public final class HotswapRuntime implements OriginalClassStore {
       throw new NullPointerException("facade is null");
     }
     Object current = ensureDelegate(facade);
+    stateMigrator.refreshInjectedFields(facade, current);
     try {
       return dispatcher.invoke(current, methodName, descriptor, args);
     }

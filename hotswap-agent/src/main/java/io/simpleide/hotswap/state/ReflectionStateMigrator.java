@@ -21,6 +21,41 @@ import java.util.Map;
 public final class ReflectionStateMigrator implements StateMigrator {
 
   /**
+   * 调用前补齐框架在 facade 上后注入的依赖，不覆盖版本中的普通业务状态或新增依赖。
+   *
+   * @param facade 框架持有并完成注入的原对象
+   * @param version 当前版本对象
+   * @throws Exception 字段访问或写入失败
+   */
+  public void refreshInjectedFields(Object facade, Object version) throws Exception {
+    Map<String, Field> targetFields = instanceFields(version.getClass());
+    for (Map.Entry<String, Field> entry : instanceFields(facade.getClass()).entrySet()) {
+      Field source = entry.getValue();
+      boolean injected = false;
+      for (java.lang.annotation.Annotation annotation : source.getDeclaredAnnotations()) {
+        String name = annotation.annotationType().getName();
+        if ("org.springframework.beans.factory.annotation.Autowired".equals(name)
+          || "org.springframework.beans.factory.annotation.Value".equals(name)
+          || "javax.inject.Inject".equals(name) || "jakarta.inject.Inject".equals(name)
+          || "javax.annotation.Resource".equals(name) || "jakarta.annotation.Resource".equals(name)) {
+          injected = true;
+          break;
+        }
+      }
+      Field target = targetFields.get(entry.getKey());
+      if (!injected || target == null || !source.getType().equals(target.getType())) {
+        continue;
+      }
+      source.setAccessible(true);
+      Object value = source.get(facade);
+      // facade 未注入时不能清空 schema reload 后仅存在于版本对象的依赖。
+      if (value != null) {
+        writeField(target, version, value);
+      }
+    }
+  }
+
+  /**
    * 复制旧版本对象到新版本对象的全部可匹配实例字段。
    *
    * @param from 旧版本对象
